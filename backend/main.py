@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
 from typing import List, Optional
-from datetime import datetime
 import uvicorn
 import os
+import subprocess
 
 app = FastAPI(title="Kocaeli Local News Map API")
 
@@ -17,6 +18,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount the frontend directory to serve static HTML/CSS/JS files
+# This makes the app available at http://localhost:8000/
+frontend_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
+app.mount("/app", StaticFiles(directory=frontend_path, html=True), name="frontend")
 
 # MongoDB Connection String
 MONGO_URL = "mongodb://localhost:27017"
@@ -72,6 +78,23 @@ async def get_news(
         news_list.append(document)
         
     return news_list
+
+@app.post("/api/scrape")
+async def trigger_scraper():
+    """
+    Triggers the scraping pipeline in the background.
+    """
+    try:
+        # Get the path to the current virtual environment's python
+        venv_python = os.path.join(os.getcwd(), ".venv", "Scripts", "python.exe")
+        if not os.path.exists(venv_python):
+            venv_python = "python" # Fallback
+            
+        # Run the standalone scraper script async
+        subprocess.Popen([venv_python, "backend/scraper_runner.py"])
+        return {"status": "success", "message": "Scraping started in the background..."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
