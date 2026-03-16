@@ -1,32 +1,22 @@
-from pymongo import MongoClient
-import sys
+from motor.motor_asyncio import AsyncIOMotorClient
+import asyncio
 
-def check():
-    try:
-        client = MongoClient('mongodb://localhost:27017')
-        db = client.kocaeli_news
-        news_items = list(db.news.find({}, {'title': 1, 'category': 1, 'url': 1}))
-        
-        print(f"Total News in DB: {len(news_items)}")
-        print("-" * 50)
-        
-        # Check specific problematic ones
-        target_title = "Sahte Para, Uyuşturucu ve Ruhsatsız Silah Ele Geçirildi"
-        
-        for item in news_items:
-            cat = item.get('category')
-            title = item.get('title')
-            url = item.get('url')
-            
-            # Print all categorized items to review
-            if cat != 'Diğer':
-                print(f"[{cat}] {title}")
-                
-            if target_title in title:
-                print(f"\n>>> FOUND TARGET: [{cat}] {title}")
-                
-    except Exception as e:
-        print(f"Error: {e}")
+async def check_db():
+    client = AsyncIOMotorClient("mongodb://localhost:27017")
+    db = client.kocaeli_news
+    count = await db.news.count_documents({})
+    print(f"Total News in DB: {count}")
+    
+    with_coords = await db.news.count_documents({"latitude": {"$ne": None}})
+    print(f"News with valid coordinates: {with_coords}")
+    
+    no_coords = await db.news.count_documents({"latitude": None})
+    print(f"News with NULL coordinates: {no_coords}")
+    
+    sample = await db.news.find().limit(10).to_list(10)
+    print("\nSample Data:")
+    for s in sample:
+        print(f"- {s['title']} | Location: {s.get('location_text')} | Coords: {s.get('latitude')}, {s.get('longitude')}")
 
 if __name__ == "__main__":
-    check()
+    asyncio.run(check_db())

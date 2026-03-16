@@ -13,23 +13,27 @@ except Exception as e:
 
 # PDF Category Definitions and Keywords (Priority order: top to bottom)
 CATEGORIES = {
-    # Strictly traffic only keywords for title match
-    "Trafik Kazası": ["trafik kazası", "zincirleme kaza", "şarampol", "takla attı"],
-    "Yangın": ["yangın", "alev", "itfaiye", "kundaklama", "kül oldu", "yanarak", "duman"],
-    "Elektrik Kesintisi": ["elektrik kesintisi", "trafo", "elektrikler kesilecek", "planlı kesinti", "sedaş", "karanlıkta kaldı"],
-    "Hırsızlık": ["hırsız", "hırsızlık", "çalındı", "soygun", "gasp", "çaldı", "yankesici", "dolandırıcı"],
-    "Kültürel Etkinlikler": ["kültürel", "etkinlik", "konser", "festival", "sergi", "tiyatro", "fuar", "kitap fuarı", "şenlik", "gösteri"]
+    "Trafik Kazası": ["trafik kazası", "zincirleme kaza", "şarampol", "takla attı", "otomobil devrildi", "feci kaza"],
+    "Yangın": ["yangın çıktı", "alevlere teslim", "itfaiye müdahale", "ev yandı", "fabrika yangını", "orman yangını", "çatıda yangın"],
+    "Elektrik Kesintisi": ["elektrik kesintisi", "planlı kesinti", "sedaş", "trafo patladı", "elektrikler kesilecek"],
+    "Hırsızlık": ["hırsızlık", "çalındı", "soygun", "gasp", "çaldı", "yankesici"],
+    "Kültürel Etkinlikler": ["konser", "festival", "tiyatro", "sergi", "kitap fuarı", "şenlik", "gösteri", "sinema", "kültür sanat"]
 }
 
-# Crime/Police operation keywords that should NOT trigger other categories (they will fall into 'Diğer')
-EXCLUSIONS = ["narkotik", "uyuşturucu", "silah", "ele geçirildi", "gözaltı", "operasyon", "sahte para", "asayiş"]
+# Crime/Police operation keywords that should always fall into 'Diğer'
+POLICE_OP_EXCLUSIONS = ["narkotik", "uyuşturucu", "silah", "ele geçirildi", "gözaltı", "operasyon", "sahte para", "asayiş"]
+
+# Municipal / Routine / Political keywords that incorrectly trigger categories
+# E.g. "Başkan iftar davet" should NOT be a "Trafik Kazası" just because it mentions a "street"
+GENERAL_EXCLUSIONS = [
+    "iftar", "davet", "başkan", "belediye", "hizmet", "proje", "ziyaret", 
+    "açılış", "tören", "kutlama", "bayram", "meclis", "seçim", "parti", 
+    "milletvekili", "valilik", "kaymakam", "program", "buluşma", "sofra"
+]
 
 def classify_news(content, title=""):
     """
-    Classifies news by searching for keywords.
-    1. Checks the title first (most accurate).
-    2. Checks content if title is inconclusive.
-    Returns the highest priority matching category.
+    Classifies news by searching for keywords with strict verification.
     """
     if not content and not title:
         return "Diğer"
@@ -37,33 +41,50 @@ def classify_news(content, title=""):
     text_to_check = (title + " " + content).lower()
     title_lower = title.lower()
     
-    # 0. Global Exclusions (If these are present, it's likely a police op/crime, so 'Diğer')
-    for exc in EXCLUSIONS:
-        if exc in text_to_check:
+    # 0. Global Exclusions (Police & General)
+    # If it's a routine city news or a crime report, it's 'Diğer'
+    all_exclusions = POLICE_OP_EXCLUSIONS + GENERAL_EXCLUSIONS
+    for exc in all_exclusions:
+        if exc in title_lower: # If it's in the title, it's almost certainly NOT a critical event
             return "Diğer"
 
-    # 1. Quick check on title (Priority)
+    # 1. Traffic Accident - Strict 2-Factor Verification
+    # Requirement: Must have an explicit accident word AND a vehicle
+    # Must NOT have traffic 'regulation' or 'limit' keywords
+    traffic_negatives = ["hız limiti", "tabela", "radar", "eds", "denetim", "ceza", "otopark", "park yasağı"]
+    if not any(tn in text_to_check for tn in traffic_negatives):
+        accident_keywords = ["kaza", "çarpıştı", "devrildi", "yaralandı", "ölü", "can pazarı", "takla", "şarampol"]
+        vehicle_keywords = ["araç", "otomobil", "kamyon", "tır", "motosiklet", "bisiklet", "minibüs", "otobüs"]
+        
+        has_accident = any(ak in text_to_check for ak in accident_keywords)
+        has_vehicle = any(vk in text_to_check for vk in vehicle_keywords)
+        
+        if has_accident and has_vehicle:
+            # Final check: If it's just a 'limit' or 'parking' news, it might still have these words
+            if not any(exc in title_lower for exc in ["otopark", "limit", "tabela"]):
+                return "Trafik Kazası"
+
+    # 2. Yangın - Refined
+    fire_keywords = ["yangın", "alev", "itfaiye", "yanarak", "kül oldu"]
+    if any(fk in title_lower for fk in fire_keywords):
+        return "Yangın"
+
+    # 3. Check other categories (Hırsızlık, Elektrik, Kültürel)
+    # Give priority to category keywords in Title
     for category, keywords in CATEGORIES.items():
+        if category == "Trafik Kazası": continue
         for keyword in keywords:
             if re.search(r'\b' + re.escape(keyword) + r'\b', title_lower):
                 return category
 
-    # 2. Strict check on Traffic Accidents 
-    # Must have both a generic accident keyword AND a vehicle keyword
-    secondary_traffic = ["kaza", "çarpıştı", "devrildi", "yaralandı", "ölü", "can pazarı"]
-    vehicle_keywords = ["araç", "otomobil", "kamyon", "tır", "motosiklet", "bisiklet", "minibüs", "servis", "otobüs"]
-
-    has_vehicle = any(v in text_to_check for v in vehicle_keywords)
-    has_secondary = any(sk in text_to_check for sk in secondary_traffic)
-
-    if has_vehicle and has_secondary:
-        return "Trafik Kazası"
-
-    # 3. Check other categories in content
+    # 4. Check Content as fallback (but be stricter)
     for category, keywords in CATEGORIES.items():
-        if category == "Trafik Kazası": continue 
+        if category == "Trafik Kazası": continue
         for keyword in keywords:
             if re.search(r'\b' + re.escape(keyword) + r'\b', text_to_check):
+                # Ensure it's not a false positive for Fire (e.g. gas leak without fire)
+                if category == "Yangın" and "gaz sızıntısı" in text_to_check and "yangın" not in title_lower:
+                    continue
                 return category
                 
     return "Diğer"

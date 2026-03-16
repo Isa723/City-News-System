@@ -26,28 +26,22 @@ def extract_location_from_text(text):
     """
     Mandatory PDF Requirement (Section 6):
     - Extract neighborhood (Mahalle), street (Sokak/Cadde) if present.
-    - Return the most specific location string.
+    - Return the MOST SPECIFIC location string.
+    - PREVENT İzmit bias: Do not force "İzmit" just because it's mentioned in the text.
     """
     if not text:
         return None
         
     text_clean = text.replace('İ', 'i').replace('I', 'ı').lower()
     
-    # 1. Detect District (Anchor)
-    district_found = None
-    for district in KOCAELI_DISTRICTS:
-        d_lower = district.replace('İ', 'i').replace('I', 'ı').lower()
-        if re.search(r'\b' + re.escape(d_lower) + r'\b', text_clean):
-            district_found = district
-            break
-            
-    # 2. Detect specific address parts (Mahalle, Cadde, Sokak)
+    # 1. Detect specific address parts first (Mahalle, Cadde, Sokak)
+    # These are highly unique and Google can find the district from them.
     specific_patterns = [
-        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Mahallesi)',
-        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Caddesi)',
-        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Bulvarı)',
-        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Sokağı)',
-        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Mevkii)'
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Mahallesi)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Caddesi)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Bulvarı)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Sokağı)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Mevkii)'
     ]
     
     specific_loc = None
@@ -55,18 +49,38 @@ def extract_location_from_text(text):
         match = re.search(pattern, text, re.I)
         if match:
             candidate = match.group(1).strip()
-            if any(junk in candidate.lower() for junk in ["haber", "sayfa", "site", "tıkla"]):
+            # Junk filter
+            if any(junk in candidate.lower() for junk in ["haber", "sayfa", "site", "tıkla", "güncel", "yerel"]):
                 continue
             specific_loc = candidate
             break
 
-    # 3. Combine results
-    if specific_loc and district_found:
-        return f"{specific_loc}, {district_found}, Kocaeli, Turkey"
-    elif specific_loc:
-        return f"{specific_loc}, Kocaeli, Turkey"
-    elif district_found:
-        return f"{district_found}, Kocaeli, Turkey"
+    # 2. Detect District as a fallback or secondary anchor
+    districts_found = []
+    for district in KOCAELI_DISTRICTS:
+        d_lower = district.replace('İ', 'i').replace('I', 'ı').lower()
+        if re.search(r'\b' + re.escape(d_lower) + r'\b', text_clean):
+            districts_found.append(district)
+
+    # 3. Combine results smartly
+    # Priority A: If we have a specific neighborhood/street, let Google find the district.
+    # We only append a district if we found only ONE district and it's NOT just mentioned as a generic tag.
+    if specific_loc:
+        # If we have a district but multiple were found, or it's 'İzmit' (common default), 
+        # just send the specific loc + Kocaeli. Google is smarter than our regex.
+        if len(districts_found) == 1 and districts_found[0] != "İzmit":
+            return f"{specific_loc}, {districts_found[0]}, Kocaeli, Turkey"
+        else:
+            return f"{specific_loc}, Kocaeli, Turkey"
+            
+    # Priority B: If no neighborhood, but we found a distinct district
+    if districts_found:
+        # Bias check: if 'İzmit' is found with others, prioritize the other one 
+        # (Since İzmit is often mentioned as the central tag)
+        if len(districts_found) > 1 and "İzmit" in districts_found:
+            other_districts = [d for d in districts_found if d != "İzmit"]
+            return f"{other_districts[0]}, Kocaeli, Turkey"
+        return f"{districts_found[0]}, Kocaeli, Turkey"
         
     return None
 
