@@ -1,11 +1,15 @@
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
-import time
+import googlemaps
+import os
 import re
+from dotenv import load_dotenv
 
-# Initialize Nominatim geocoder (Free OpenStreetMap Geocoding)
-# User_agent is required by their terms of service
-geolocator = Nominatim(user_agent="kocaeli_news_scraper_v1")
+# Load environment variables
+load_dotenv()
+
+# Initialize Google Maps Client
+# Mandatory Requirement (Section 7): "API anahtarı güvenli biçimde saklanmalıdır."
+API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+gmaps = googlemaps.Client(key=API_KEY)
 
 # Simple in-memory cache to prevent duplicate API calls for the same location
 # as requested by the assignment: "Aynı konum için gereksiz tekrar API çağrısı yapılmamalıdır"
@@ -23,7 +27,6 @@ def extract_location_from_text(text):
     Mandatory PDF Requirement (Section 6):
     - Extract neighborhood (Mahalle), street (Sokak/Cadde) if present.
     - Return the most specific location string.
-    - If no location found, news won't be shown on map.
     """
     if not text:
         return None
@@ -39,7 +42,6 @@ def extract_location_from_text(text):
             break
             
     # 2. Detect specific address parts (Mahalle, Cadde, Sokak)
-    # Pattern: [Name] Mahallesi/Caddesi/Sokağı
     specific_patterns = [
         r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Mahallesi)',
         r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Caddesi)',
@@ -50,11 +52,9 @@ def extract_location_from_text(text):
     
     specific_loc = None
     for pattern in specific_patterns:
-        match = re.search(pattern, text, re.I) # Use original text for better matching
+        match = re.search(pattern, text, re.I)
         if match:
-            # Clean up the found specific location (e.g. "Hürriyet Caddesi")
             candidate = match.group(1).strip()
-            # Basic junk filter (e.g. "Haber Mahallesi" or "Sayfa Caddesi")
             if any(junk in candidate.lower() for junk in ["haber", "sayfa", "site", "tıkla"]):
                 continue
             specific_loc = candidate
@@ -72,7 +72,7 @@ def extract_location_from_text(text):
 
 def get_coordinates(location_name):
     """
-    Calls Nominatim API to get Latitude and Longitude.
+    Calls Google Maps Geocoding API to get Latitude and Longitude.
     Uses caching to avoid redundant calls.
     Returns (latitude, longitude) or (None, None) if failed.
     """
@@ -84,17 +84,17 @@ def get_coordinates(location_name):
         return location_cache[location_name]
         
     try:
-        # Adding a small delay to respect Nominatim usage limits (1 request per second)
-        time.sleep(1.1)
-        location = geolocator.geocode(location_name, timeout=10)
+        # Geocoding using official Google Maps Client
+        result = gmaps.geocode(location_name)
         
-        if location:
-            coords = (location.latitude, location.longitude)
+        if result:
+            location = result[0]['geometry']['location']
+            coords = (location['lat'], location['lng'])
             # Save to cache
             location_cache[location_name] = coords
             return coords
             
-    except (GeocoderTimedOut, GeocoderUnavailable) as e:
-        print(f"Geocoding failed for {location_name}: {e}")
+    except Exception as e:
+        print(f"Google Geocoding failed for {location_name}: {e}")
         
     return None, None
