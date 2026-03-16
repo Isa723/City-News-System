@@ -17,19 +17,30 @@ RSS_FEEDS = {
 
 def clean_html_text(raw_html):
     """
-    Mandatory PDF Requirement:
+    Mandatory PDF Requirement (Section 4):
     - HTML tag temizliği yapılmalıdır.
     - Fazla boşluklar temizlenmelidir.
     - Gereksiz özel karakterler temizlenmelidir.
+    - Metin normalizasyonu (Lowercasing, char cleanup).
     """
     if not raw_html:
         return ""
-    # Remove HTML tags using bs4
+        
+    # 1. Remove HTML tags using bs4
     soup = BeautifulSoup(raw_html, "html.parser")
     text = soup.get_text(separator=" ")
     
-    # Remove extra spaces and newlines
+    # 2. Text Normalization (Correctly handling Turkish chars for lowercasing if needed later)
+    # Removing non-printable and unusual control characters
+    text = "".join(ch for ch in text if ch.isprintable())
+    
+    # 3. Special Character Cleanup
+    # Removing excessive non-standard chars while keeping punctuation
+    text = re.sub(r'[^\w\s\.\,!\?\-\:\(\)]', ' ', text)
+    
+    # 4. Remove extra spaces and newlines
     text = re.sub(r'\s+', ' ', text).strip()
+    
     return text
 
 def scrape_article_content(url):
@@ -45,10 +56,35 @@ def scrape_article_content(url):
             
         soup = BeautifulSoup(response.content, "lxml")
         
-        # Most news sites put content in <p> tags inside an article or content div.
-        # We will extract all <p> text that belongs to the main body.
-        paragraphs = soup.find_all('p')
-        content = " ".join([p.get_text() for p in paragraphs])
+        # Try to find the main article container first
+        # Common classes for these 5 Kocaeli sites
+        content_container = soup.find('div', class_=re.compile(r'article-content|news-content|detail-content|entry-content|habericerik|detay-metin', re.I))
+        
+        if content_container:
+            # If we found a container, only get <p> from inside it
+            paragraphs = content_container.find_all('p')
+        else:
+            # Fallback: exclude common non-article areas then get <p>
+            for junk in soup.find_all(['footer', 'nav', 'aside', 'header']):
+                junk.decompose()
+            paragraphs = soup.find_all('p')
+
+        # Filter out very short strings and common boilerplate
+        clean_paragraphs = []
+        boilerplate_patterns = [
+            r'tıklayın', r'takip edin', r'abone olun', r'yazılı haber',
+            r'copyright', r'tüm hakları', r'haber merkez', r'reklam'
+        ]
+        
+        for p in paragraphs:
+            text = p.get_text().strip()
+            # Length filter + ensure it's not a common boilerplate line
+            if len(text) > 40: 
+                is_junk = any(re.search(pat, text, re.I) for pat in boilerplate_patterns)
+                if not is_junk:
+                    clean_paragraphs.append(text)
+
+        content = " ".join(clean_paragraphs)
         
         return clean_html_text(content)
     except Exception as e:

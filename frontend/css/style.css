@@ -306,21 +306,85 @@ body {
     color: var(--accent);
 }
 
-.popup-link {
-    display: block;
-    text-align: center;
+/* Marker Symbols */
+.custom-marker-wrapper {
+    position: relative;
+    width: 36px;
+    height: 36px;
+    filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));
+}
+
+.marker-symbol {
+    position: absolute;
+    top: 8px;
+    left: 18px;
+    transform: translateX(-50%);
+    color: #fff;
+    font-size: 14px;
+    pointer-events: none;
+}
+
+/* Updated Sources List & Buttons */
+.sources-list {
+    margin-top: 15px;
+    padding-top: 15px;
+    border-top: 1px solid var(--glass-border);
+}
+
+.sources-label {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+
+.source-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: rgba(13, 17, 23, 0.3);
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+}
+
+.source-name {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-main);
+}
+
+.go-to-btn {
     background: var(--accent);
     color: #fff !important;
     text-decoration: none;
-    padding: 8px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 6px 10px;
     border-radius: 6px;
-    font-size: 0.85rem;
-    font-weight: 600;
     transition: 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 5px;
 }
 
-.popup-link:hover {
+.go-to-btn:hover {
     background: var(--btn-hover);
+    transform: scale(1.05);
+}
+
+.popup-footer {
+    margin-top: 10px;
+    opacity: 0.8;
+}
+
+.popup-snippet {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-style: italic;
+    line-height: 1.4;
 }
 
 /* Animations */

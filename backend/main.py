@@ -30,6 +30,10 @@ client = None
 db = None
 
 # Pydantic Model for a News Item
+class SourceItem(BaseModel):
+    name: str
+    url: str
+
 class NewsItem(BaseModel):
     title: str
     content: str
@@ -38,8 +42,7 @@ class NewsItem(BaseModel):
     latitude: Optional[float]
     longitude: Optional[float]
     publish_date: str
-    source: str
-    url: str
+    sources: List[SourceItem]
 
 @app.on_event("startup")
 async def startup_db_client():
@@ -67,7 +70,7 @@ async def get_news(
     if category:
         query["category"] = category
     if source:
-        query["source"] = source
+        query["sources.name"] = source
         
     news_cursor = db.news.find(query).sort("publish_date", -1)
     news_list = []

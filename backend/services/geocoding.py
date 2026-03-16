@@ -20,28 +20,53 @@ KOCAELI_DISTRICTS = [
 
 def extract_location_from_text(text):
     """
-    Searches the news text for known Kocaeli districts or neighborhoods.
-    Returns the most specific location string found.
+    Mandatory PDF Requirement (Section 6):
+    - Extract neighborhood (Mahalle), street (Sokak/Cadde) if present.
+    - Return the most specific location string.
+    - If no location found, news won't be shown on map.
     """
     if not text:
         return None
         
-    text_upper = text.upper()
+    text_clean = text.replace('İ', 'i').replace('I', 'ı').lower()
     
-    # Simple district matching
-    # In a real-world scenario, we would use NER (Named Entity Recognition),
-    # but for this assignment, finding the district name is sufficient.
-    found_districts = []
+    # 1. Detect District (Anchor)
+    district_found = None
     for district in KOCAELI_DISTRICTS:
-        if re.search(r'\b' + re.escape(district.upper()) + r'\b', text_upper):
-            found_districts.append(district)
+        d_lower = district.replace('İ', 'i').replace('I', 'ı').lower()
+        if re.search(r'\b' + re.escape(d_lower) + r'\b', text_clean):
+            district_found = district
+            break
             
-    if found_districts:
-        # If multiple districts are mentioned, we take the first one found 
-        # or combine them, but Nominatim works best with a single specific location.
-        # We append "Kocaeli" to ensure geocoding finds the right province.
-        loc = f"{found_districts[0]}, Kocaeli, Turkey"
-        return loc
+    # 2. Detect specific address parts (Mahalle, Cadde, Sokak)
+    # Pattern: [Name] Mahallesi/Caddesi/Sokağı
+    specific_patterns = [
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Mahallesi)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Caddesi)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Bulvarı)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Sokağı)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9]+ Mevkii)'
+    ]
+    
+    specific_loc = None
+    for pattern in specific_patterns:
+        match = re.search(pattern, text, re.I) # Use original text for better matching
+        if match:
+            # Clean up the found specific location (e.g. "Hürriyet Caddesi")
+            candidate = match.group(1).strip()
+            # Basic junk filter (e.g. "Haber Mahallesi" or "Sayfa Caddesi")
+            if any(junk in candidate.lower() for junk in ["haber", "sayfa", "site", "tıkla"]):
+                continue
+            specific_loc = candidate
+            break
+
+    # 3. Combine results
+    if specific_loc and district_found:
+        return f"{specific_loc}, {district_found}, Kocaeli, Turkey"
+    elif specific_loc:
+        return f"{specific_loc}, Kocaeli, Turkey"
+    elif district_found:
+        return f"{district_found}, Kocaeli, Turkey"
         
     return None
 

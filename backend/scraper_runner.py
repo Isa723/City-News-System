@@ -28,41 +28,59 @@ async def run_pipeline():
     for item in raw_news_list:
         content = item['content']
         title = item['title']
+        source_name = item['source']
+        url = item['url']
         
-        # 2. Prevent Duplicates (Exact URL)
-        exists = await news_collection.find_one({"url": item["url"]})
+        # 2. Prevent Exact Duplicates (Check if this URL is already in any source list)
+        exists = await news_collection.find_one({"sources.url": url})
         if exists:
+            # We already have this exact article from this source
             continue
             
-        # 2. Prevent Duplicates (%90 Similarity embedding check per PDF rules)
+        # 2. Prevent Semantic Duplicates (%90 Similarity)
+        # Requirement: "Farklı haber kaynaklarında yer alan ancak içerik olarak aynı olan 
+        # haberler tek bir haber olarak değerlendirilmelidir. Haber kaynaklarının tümü listelenmelidir."
         print(f"🧠 Checking '{title}' for semantic duplicates...")
-        duplicate, score = is_duplicate(content, existing_texts)
+        duplicate, score, matched_text = is_duplicate(content, existing_texts)
+        
         if duplicate:
-            print(f"   ❌ Duplicate rejected (Similarity {score*100:.1f}%)")
+            print(f"   🔗 Duplicate found ({score*100:.1f}%), adding {source_name} to sources list.")
+            await news_collection.update_one(
+                {"content": matched_text},
+                {"$addToSet": {"sources": {"name": source_name, "url": url}}}
+            )
             continue
             
-        # 3. Classify News (Trafik, Yangın vs.)
-        category = classify_news(content)
-        item['category'] = category
+        # 3. Classify News (Trafik, Yangın vs. - passing title for priority)
+        category = classify_news(content, title=title)
+        
+        # Prepare item for insertion with sources list
+        db_item = {
+            "title": title,
+            "content": content,
+            "category": category,
+            "publish_date": item["publish_date"],
+            "sources": [{"name": source_name, "url": url}]
+        }
         
         # 4. Extract Location and Geocode
         location_text = extract_location_from_text(content)
         if not location_text:
-            # Drop if strict coordinate visualizer is mandated, but PDF says:
-            # "Konum bulunamazsa, haber haritada gösterilmemelidir."
-            # We save it anyway, but with no coordinates, frontend will hide it.
-            item['location_text'] = "Belirtilmemiş"
-            item['latitude'] = None
-            item['longitude'] = None
-        else:
-            item['location_text'] = location_text
-            lat, lng = get_coordinates(location_text)
-            item['latitude'] = lat
-            item['longitude'] = lng
+            print(f"   [!] No location found for '{title}'. Skipping.")
+            continue
+            
+        lat, lng = get_coordinates(location_text)
+        if lat is None or lng is None:
+            print(f"   [!] Geocoding failed for '{location_text}'. Skipping.")
+            continue
+            
+        db_item['location_text'] = location_text
+        db_item['latitude'] = lat
+        db_item['longitude'] = lng
             
         # 5. Save to MongoDB
-        await news_collection.insert_one(item)
-        existing_texts.append(content)  # Update in-memory texts to prevent duplicates within the same batch
+        await news_collection.insert_one(db_item)
+        existing_texts.append(content)
         saved_count += 1
         print(f"   ✅ Saved: [{category}] {title}")
         

@@ -8,43 +8,36 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r
     maxZoom: 20
 }).addTo(map);
 
-// Color mapping for markers based on category
-const categoryColors = {
-    "Trafik Kazası": "#ff5e5e",
-    "Yangın": "#ffaa00",
-    "Elektrik Kesintisi": "#00bcd4",
-    "Hırsızlık": "#9c27b0",
-    "Kültürel Etkinlikler": "#4caf50",
-    "Diğer": "#707070"
-};
-
-const categoryClasses = {
-    "Trafik Kazası": "cat-trafik",
-    "Yangın": "cat-yangin",
-    "Elektrik Kesintisi": "cat-elektrik",
-    "Hırsızlık": "cat-hirsizlik",
-    "Kültürel Etkinlikler": "cat-kulturel",
-    "Diğer": "cat-other"
+// Icon mapping for FontAwesome symbols
+const categoryIcons = {
+    "Trafik Kazası": "fa-car-burst",
+    "Yangın": "fa-fire",
+    "Elektrik Kesintisi": "fa-bolt",
+    "Hırsızlık": "fa-user-secret",
+    "Kültürel Etkinlikler": "fa-masks-theater",
+    "Diğer": "fa-circle-info"
 };
 
 // Global scope to store markers and data
 let allNewsData = [];
 let mapMarkers = [];
 
-// Helper function to create custom colored SVG markers
-function createCustomIcon(color) {
+// Helper function to create custom colored SVG markers with symbols
+function createCustomIcon(color, iconClass) {
     const svgMarker = `
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
-            <path fill="${color}" stroke="#ffffff" stroke-width="2" d="M16 0C10.5 0 6 4.5 6 10c0 7.5 10 22 10 22s10-14.5 10-22c0-5.5-4.5-10-10-10z"/>
-            <circle fill="#ffffff" cx="16" cy="10" r="4"/>
-        </svg>`;
+        <div class="custom-marker-wrapper">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="36" height="36">
+                <path fill="${color}" stroke="#ffffff" stroke-width="2" d="M16 0C10.5 0 6 4.5 6 10c0 7.5 10 22 10 22s10-14.5 10-22c0-5.5-4.5-10-10-10z"/>
+            </svg>
+            <i class="fa-solid ${iconClass} marker-symbol"></i>
+        </div>`;
     
     return L.divIcon({
         className: 'custom-div-icon',
         html: svgMarker,
-        iconSize: [32, 32],
-        iconAnchor: [16, 32],
-        popupAnchor: [0, -32]
+        iconSize: [36, 36],
+        iconAnchor: [18, 36],
+        popupAnchor: [0, -36]
     });
 }
 
@@ -74,7 +67,8 @@ function renderMarkers(filteredData) {
         if (!news.latitude || !news.longitude) return;
         
         const catColor = categoryColors[news.category] || categoryColors["Diğer"];
-        const customIcon = createCustomIcon(catColor);
+        const iconClass = categoryIcons[news.category] || categoryIcons["Diğer"];
+        const customIcon = createCustomIcon(catColor, iconClass);
         
         // Parse the date
         const dateObj = new Date(news.publish_date);
@@ -84,23 +78,46 @@ function renderMarkers(filteredData) {
         
         const catClass = categoryClasses[news.category] || "cat-other";
         
+        // Render sources list as "Habere Git" buttons (Mandatory Section 8)
+        let sourcesHtml = '';
+        if (news.sources && Array.isArray(news.sources)) {
+            sourcesHtml = news.sources.map(s => 
+                `<div class="source-item">
+                    <span class="source-name">${s.name}</span>
+                    <a href="${s.url}" target="_blank" class="go-to-btn">Habere Git <i class="fa-solid fa-arrow-up-right-from-square"></i></a>
+                </div>`
+            ).join('');
+        } else {
+            // Fallback for old schema
+            sourcesHtml = `
+                <div class="source-item">
+                    <span class="source-name">${news.source}</span>
+                    <a href="${news.url}" target="_blank" class="go-to-btn">Habere Git <i class="fa-solid fa-arrow-up-right-from-square"></i></a>
+                </div>`;
+        }
+        
         // Popup Content Template
         const popupContent = `
             <div class="popup-header">
-                <span class="popup-category ${catClass}">${news.category}</span>
+                <span class="popup-category ${catClass}"><i class="fa-solid ${iconClass}"></i> ${news.category}</span>
                 <div class="popup-title">${news.title}</div>
             </div>
             <div class="popup-meta">
                 <div><i class="fa-solid fa-clock"></i> ${dateString}</div>
-                <div><i class="fa-solid fa-newspaper"></i> ${news.source}</div>
                 <div><i class="fa-solid fa-location-crosshairs"></i> ${news.location_text}</div>
             </div>
-            <a href="${news.url}" target="_blank" class="popup-link">Habere Git <i class="fa-solid fa-arrow-up-right-from-square" style="font-size: 0.75rem; margin-left: 5px;"></i></a>
+            <div class="sources-list">
+                <div class="sources-label">Kaynaklar:</div>
+                ${sourcesHtml}
+            </div>
+            <div class="popup-footer">
+                <p class="popup-snippet">${news.content.substring(0, 100)}...</p>
+            </div>
         `;
         
         // Create marker
         const marker = L.marker([news.latitude, news.longitude], { icon: customIcon })
-            .bindPopup(popupContent, { minWidth: 260, maxWidth: 320 });
+            .bindPopup(popupContent, { minWidth: 280, maxWidth: 320 });
             
         // Add to map and our tracking array
         marker.addTo(map);
