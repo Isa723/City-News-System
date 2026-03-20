@@ -101,20 +101,32 @@ def parse_date(date_str):
         # Fallback to current time if unparseable
         return datetime.now(pytz.utc)
 
-async def scrape_all_sources():
+async def scrape_all_sources(date_from: str | None = None, date_to: str | None = None):
     """
     Main entry point for scraping.
-    Fetches the 5 RSS feeds, gets items from the last 3 days,
+    Fetches the 5 RSS feeds, gets items in the given date range (defaults to last 3 days),
     and returns a list of dictionaries with raw news data.
     """
     scraped_data = []
     
-    # PDF Requirement: Son 3 günlük zaman dilimi
-    three_days_ago = datetime.now(pytz.utc) - timedelta(days=3)
+    # PDF Requirement: Son 3 günlük zaman dilimi (default)
+    now_utc = datetime.now(pytz.utc)
+    if not date_from and not date_to:
+        start_dt = now_utc - timedelta(days=4)
+        end_dt = now_utc
+    else:
+        start_dt = datetime.fromisoformat((date_from or "").replace("Z", "+00:00")) if date_from else (now_utc - timedelta(days=4))
+        end_dt = datetime.fromisoformat((date_to or "").replace("Z", "+00:00")) if date_to else now_utc
     
     for source_name, feed_url in RSS_FEEDS.items():
         print(f"[*] Scraping strictly from: {source_name}")
-        feed = feedparser.parse(feed_url)
+        try:
+            # feedparser hangs forever on dead sites. Use requests + timeout!
+            resp = requests.get(feed_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+            feed = feedparser.parse(resp.content)
+        except Exception as e:
+            print(f"   [!] Failed to reach {source_name} feed: {e}")
+            continue
         
         for entry in feed.entries:
             # Parse Date
@@ -124,8 +136,8 @@ async def scrape_all_sources():
             else:
                 continue
                 
-            # Filter for last 3 days only
-            if pub_date < three_days_ago:
+            # Filter by requested range
+            if pub_date < start_dt or pub_date > end_dt:
                 continue
                 
             # Extract basic data

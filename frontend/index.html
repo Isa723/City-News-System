@@ -46,7 +46,6 @@
                         <option value="Elektrik Kesintisi">Elektrik Kesintisi</option>
                         <option value="Hırsızlık">Hırsızlık</option>
                         <option value="Kültürel Etkinlikler">Kültürel Etkinlikler</option>
-                        <option value="Diğer">Diğer / Sınıflandırılamayan</option>
                     </select>
                 </div>
                 
@@ -72,9 +71,10 @@
                 <div class="form-group">
                     <label>Tarih</label>
                     <select id="dateFilter" class="glass-input">
-                        <option value="all">Tüm Zamanlar (Son 3 Gün)</option>
-                        <option value="today">Bugün</option>
-                        <option value="yesterday">Dün</option>
+                        <option value="1">son 1 gun</option>
+                        <option value="2">son 2 gun</option>
+                        <option value="3">son 3 gun</option>
+                        <option value="4" selected>son 4 gun</option>
                     </select>
                 </div>
                 
@@ -100,7 +100,7 @@
         
     </div>
 
-    <!-- Google Maps JS API -->
+    <!-- Google Maps JS API (use your key here) -->
     <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyC_4VYXludmLl5bt2m_lxKI-M_gY6Arb4Q&callback=initMap" defer></script>
     <!-- Custom Logic -->
     <script src="js/app.js"></script>
