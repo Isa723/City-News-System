@@ -45,14 +45,23 @@ def classify_news(content, title=""):
     if not content and not title:
         return "Diğer"
 
-    text_to_check = (title + " " + content).lower()
+    # Analyze only the Title and the first 400 characters of the body.
+    # This acts as a bulletproof shield against "Related News" widgets or footer menus
+    # that inject words like "Trafik Kazası" or "Yangın" into unrelated articles.
+    text_to_check = (title + " " + content[:400]).lower()
     title_lower = title.lower()
 
     # Helper: checks if ANY of the exact words/phrases are in the text
+    # Includes common Turkish suffixes (noun cases/plurals) so we don't miss 'otobüsü' while looking for 'otobüs'
     def has_exact(word_list, text):
+        suffixes = r'(?:lar|ler)?(?:ı|i|u|ü|a|e|da|de|ta|te|ya|ye|na|ne|nın|nin|nun|nün|dan|den|tan|ten|sı|si|su|sü|yı|yi|yu|yü)?'
         for w in word_list:
-            if re.search(r'\b' + re.escape(w) + r'\b', text):
-                return True
+            if ' ' in w: # Compound words/phrases are matched strictly
+                if re.search(r'\b' + re.escape(w) + r'\b', text):
+                    return True
+            else: # Single words allow valid Turkish suffixes attached directly to them
+                if re.search(r'\b' + re.escape(w) + suffixes + r'\b', text):
+                    return True
         return False
 
     # 0. Global Exclusions (Crime operations, sports, irrelevant daily events, NATIONAL CITIES)
@@ -61,7 +70,8 @@ def classify_news(content, title=""):
         "iftar", "davet", "belediye başkanı", "ziyaret", "açılış", "tören", 
         "kutlama", "bayram", "meclis toplantısı", "milletvekili", 
         "antrenman", "turnuva", "müsabaka", "şampiyona", "spor", "idman", "kupa",
-        "fenomen", "sosyal medya", "tutuklama", "gözaltı"
+        "fenomen", "sosyal medya", "tutuklama", "gözaltı", "darbe", "yakalandı", 
+        "ihraç", "terör", "firari", "cezaevi", "hapis", "emniyet", "polis"
     ]
     
     # NATIONAL CITIES (Exclude completely to satisfy "Yalnızca Kocaeli" rule)
@@ -189,4 +199,5 @@ def is_duplicate(new_text, existing_items, threshold=0.90):
     if max_score >= threshold:
         return True, max_score, matched
     return False, max_score, None
+
 
