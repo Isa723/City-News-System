@@ -81,6 +81,12 @@ async def run_pipeline(date_from: str | None = None, date_to: str | None = None)
         }
         
         # 4. Extract Location (structured) and Geocode
+        # STRICT KOCAELI REQUIREMENT (PDF Section 2: Yalnızca Kocaeli)
+        KOCAELI_KEYWORDS = ["kocaeli", "izmit", "gebze", "gölcük", "derince", "darıca", "körfez", "kartepe", "başiskele", "karamürsel", "kandıra", "dilovası", "çayırova"]
+        if not any(k in content.lower() or k in title.lower() for k in KOCAELI_KEYWORDS):
+            print(f"   [!] Non-Kocaeli national news detected ('{title}'). Skipping.")
+            continue
+
         loc_info = extract_location_info(content)
         if not loc_info:
             print(f"   [!] No location found for '{title}'. Skipping.")

@@ -55,62 +55,79 @@ def classify_news(content, title=""):
                 return True
         return False
 
-    # 0. Global Exclusions (Crime operations, sports, irrelevant daily events)
+    # 0. Global Exclusions (Crime operations, sports, irrelevant daily events, NATIONAL CITIES)
     exclusions = [
         "narkotik", "uyuşturucu", "silah ele", "sahte para", "operasyon", "şüpheli", 
         "iftar", "davet", "belediye başkanı", "ziyaret", "açılış", "tören", 
         "kutlama", "bayram", "meclis toplantısı", "milletvekili", 
-        "antrenman", "turnuva", "müsabaka", "şampiyona", "spor", "idman", "kupa"
+        "antrenman", "turnuva", "müsabaka", "şampiyona", "spor", "idman", "kupa",
+        "fenomen", "sosyal medya", "tutuklama", "gözaltı"
     ]
-    # If the title heavily implies a police op or a sport event, skip immediately (unless it's a cultural event)
-    if has_exact(exclusions, title_lower):
-        # We only let it pass if it's explicitly explicitly a cultural event 
+    
+    # NATIONAL CITIES (Exclude completely to satisfy "Yalnızca Kocaeli" rule)
+    national_cities = [
+        "adana", "ankara", "antalya", "aydın", "balıkesir", "bursa", "diyarbakır", 
+        "erzurum", "eskişehir", "gaziantep", "hatay", "mersin", "istanbul", "izmir", 
+        "kayseri", "konya", "malatya", "manisa", "kahramanmaraş", "mardin", "muğla", 
+        "ordu", "samsun", "şanlıurfa", "tekirdağ", "trabzon", "van"
+    ]
+    
+    if has_exact(exclusions, title_lower) or has_exact(national_cities, title_lower):
         if not has_exact(["konser", "festival", "tiyatro", "sergi"], title_lower):
             return "Diğer"
 
+    # Require strong keywords specifically in TITLE to bypass footer/menu pollution in content
+    # OR require highly unique words in content
+    
     # 1. Trafik Kazası
     traffic_exact = ["trafik kazası", "zincirleme", "şarampol", "takla attı", "feci kaza", "araç takla"]
-    if has_exact(traffic_exact, text_to_check):
+    if has_exact(traffic_exact, title_lower) or has_exact(traffic_exact, text_to_check):
         return "Trafik Kazası"
         
     kaza_words = ["kaza", "kazası", "kazada", "kazaya", "çarpıştı", "devrildi", "yaya çarp"]
     vehicle_words = ["araç", "aracı", "araçlar", "araçta", "otomobil", "kamyon", "tır", "motosiklet", "bisiklet", "minibüs", "otobüs"]
     
-    if has_exact(kaza_words, text_to_check) and has_exact(vehicle_words, text_to_check):
+    if has_exact(kaza_words, title_lower) and has_exact(vehicle_words, text_to_check):
         if not has_exact(["iş kazası", "görünmez kaza", "iş cinayeti"], text_to_check):
             return "Trafik Kazası"
 
     # 2. Yangın
-    fire_words = ["yangın", "yangını", "yangında", "yangına", "alevlere teslim", "itfaiye", "itfaiyesi", "kül oldu", "kundaklama", "kundaklandı"]
+    fire_words = ["yangın", "yangını", "yangında", "yangına", "alevlere teslim", "kül oldu", "kundaklama", "kundaklandı"]
     if has_exact(fire_words, title_lower):
         return "Yangın"
-    if has_exact(fire_words, text_to_check):
-        # Prevent false positives like 'orman yangını tatbikatı' or someone whose name is Alev 
-        if not has_exact(["tatbikat", "tatbikatı", "film", "dizi"], text_to_check):
+        
+    # If "itfaiye" is in text, it might just be a rescue (e.g. falling from window)
+    if has_exact(["itfaiye", "yangın"], text_to_check):
+        if has_exact(fire_words, title_lower) or "alev" in title_lower:
             return "Yangın"
-
+        # If no fire words in title, it's highly prone to false positives from menus. Reject.
+        
     # 3. Diğer Kategoriler (Elektrik, Hırsızlık, Kültürel Etkinlikler)
     OTHER_CATEGORIES = {
         "Elektrik Kesintisi": [
             "elektrik kesintisi", "planlı kesinti", "sedaş", "trafo patladı", "elektrikler kesilecek", "elektrik kesilecek", "elektrik arızası"
         ],
         "Hırsızlık": [
-            "hırsızlık", "soygun", "gasp", "yankesici", "hırsız", "kuyumcu soygunu", "çalındı", "çaldı"
+            "hırsızlık", "soygun", "gasp", "yankesici", "kuyumcu soygunu"
         ],
         "Kültürel Etkinlikler": [
             "konser", "festival", "tiyatro", "sergi", "kitap fuarı", "şenlik", "gösteri", "sinema", "kültür sanat", "etkinlik", "söyleşi"
         ]
     }
 
-    # Title match gets priority
+    # Title match gets absolute priority
     for category, keywords in OTHER_CATEGORIES.items():
         if has_exact(keywords, title_lower):
             return category
 
-    # Body match
+    # Very strict content fallback for specific events
     for category, keywords in OTHER_CATEGORIES.items():
         if has_exact(keywords, text_to_check):
-            return category
+            # To prevent random menu matches, only allow if the keyword is uniquely descriptive
+            if category == "Elektrik Kesintisi" and has_exact(["elektrik kesintisi", "sedaş"], text_to_check):
+                return category
+            if category == "Hırsızlık" and has_exact(["soygun", "gasp", "yankesici"], text_to_check):
+                return category
 
     return "Diğer"
 
