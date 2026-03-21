@@ -27,20 +27,20 @@ KOCAELI_DISTRICTS = [
     "Kandıra", "Dilovası", "Çayırova"
 ]
 
-def extract_location_info(text: str) -> Optional[Dict[str, Any]]:
+def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
     """
     Mandatory PDF Requirement (Section 6):
     - Extract neighborhood (Mahalle), street (Sokak/Cadde) if present.
-    - Return the MOST SPECIFIC location string.
-    - PREVENT İzmit bias: Do not force "İzmit" just because it's mentioned in the text.
+    - Avoid footer pollution by only parsing the top 500 characters.
     """
-    if not text:
+    if not text and not title:
         return None
         
-    text_clean = text.replace('İ', 'i').replace('I', 'ı').lower()
+    # Only search the title and top of text to avoid footer pollution (like newspaper address)
+    search_text = title + " " + text[:500]
+    text_clean = search_text.replace('İ', 'i').replace('I', 'ı').lower()
     
     # 1. Detect specific address parts first (Mahalle, Cadde, Sokak)
-    # These are highly unique and Google can find the district from them.
     specific_patterns = [
         r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Mahallesi)',
         r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Caddesi)',
@@ -52,7 +52,7 @@ def extract_location_info(text: str) -> Optional[Dict[str, Any]]:
     candidates: List[str] = []
     specific_loc: Optional[str] = None
     for pattern in specific_patterns:
-        for match in re.finditer(pattern, text, re.I):
+        for match in re.finditer(pattern, search_text, re.I):
             candidate = match.group(1).strip()
             # Junk filter
             if any(junk in candidate.lower() for junk in ["haber", "sayfa", "site", "tıkla", "güncel", "yerel"]):
@@ -72,13 +72,9 @@ def extract_location_info(text: str) -> Optional[Dict[str, Any]]:
             candidates.append(district)
 
     # 3. Combine results smartly
-    # Priority A: If we have a specific neighborhood/street, let Google find the district.
-    # We only append a district if we found only ONE district and it's NOT just mentioned as a generic tag.
     district: Optional[str] = None
 
     if specific_loc:
-        # If we have a district but multiple were found, or it's 'İzmit' (common default), 
-        # just send the specific loc + Kocaeli. Google is smarter than our regex.
         if len(districts_found) == 1 and districts_found[0] != "İzmit":
             district = districts_found[0]
             best = f"{specific_loc}, {districts_found[0]}, Kocaeli, Turkey"
@@ -91,10 +87,7 @@ def extract_location_info(text: str) -> Optional[Dict[str, Any]]:
             "candidates": sorted(set(candidates)),
         }
             
-    # Priority B: If no neighborhood, but we found a distinct district
     if districts_found:
-        # Bias check: if 'İzmit' is found with others, prioritize the other one 
-        # (Since İzmit is often mentioned as the central tag)
         if len(districts_found) > 1 and "İzmit" in districts_found:
             other_districts = [d for d in districts_found if d != "İzmit"]
             district = other_districts[0]
@@ -113,8 +106,7 @@ def extract_location_info(text: str) -> Optional[Dict[str, Any]]:
 async def get_coordinates(db: AsyncIOMotorDatabase, location_name: str) -> Tuple[Optional[float], Optional[float]]:
     """
     Calls Google Maps Geocoding API to get Latitude and Longitude.
-    Uses MongoDB-backed caching to avoid redundant calls across restarts.
-    Returns (latitude, longitude) or (None, None) if failed.
+    STRICT VALIDATION: Rejects mapped coordinates if they fall outside Kocaeli Province.
     """
     if not location_name:
         return None, None
@@ -131,6 +123,12 @@ async def get_coordinates(db: AsyncIOMotorDatabase, location_name: str) -> Tuple
     try:
         result = await asyncio.to_thread(lambda: gmaps.geocode(location_name))
         if result:
+            # Strict safety filter: ensure Google didn't map "Yalıkavak, Kocaeli" to "Bodrum, Muğla"
+            address = result[0].get("formatted_address", "")
+            if "Kocaeli" not in address:
+                print(f"Skipping {location_name}: Google mapped it outside Kocaeli -> {address}")
+                return None, None
+                
             loc = result[0].get("geometry", {}).get("location", {})
             lat, lng = loc.get("lat"), loc.get("lng")
             if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
@@ -151,7 +149,7 @@ def extract_location_from_text(text: str) -> Optional[str]:
     Backwards-compatible helper for older callers.
     Returns best_location_text or None.
     """
-    info = extract_location_info(text)
+    info = extract_location_info("", text)
     if not info:
         return None
     return info["best_location_text"]

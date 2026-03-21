@@ -122,7 +122,7 @@ async def scrape_all_sources(date_from: str | None = None, date_to: str | None =
         print(f"[*] Scraping strictly from: {source_name}")
         try:
             # feedparser hangs forever on dead sites. Use requests + timeout!
-            resp = requests.get(feed_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+            resp = requests.get(feed_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20)
             feed = feedparser.parse(resp.content)
         except Exception as e:
             print(f"   [!] Failed to reach {source_name} feed: {e}")
