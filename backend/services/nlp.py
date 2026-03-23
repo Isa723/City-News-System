@@ -90,11 +90,11 @@ def classify_news(content, title=""):
     # OR require highly unique words in content
     
     # 1. Trafik Kazası
-    traffic_exact = ["trafik kazası", "zincirleme", "şarampol", "takla attı", "feci kaza", "araç takla"]
+    traffic_exact = ["trafik kazası", "zincirleme", "şarampol", "takla attı", "feci kaza", "araç takla", "direksiyon hakimiyet", "direksiyon hakimiyetini", "motor kazası"]
     if has_exact(traffic_exact, title_lower) or has_exact(traffic_exact, text_to_check):
         return "Trafik Kazası"
         
-    kaza_words = ["kaza", "kazası", "kazada", "kazaya", "çarpıştı", "devrildi", "yaya çarp"]
+    kaza_words = ["kaza", "kazası", "kazada", "kazaya", "çarpıştı", "devrildi", "çarptı", "çarptığı", "ezdi"]
     vehicle_words = ["araç", "aracı", "araçlar", "araçta", "otomobil", "kamyon", "tır", "motosiklet", "bisiklet", "minibüs", "otobüs"]
     
     if has_exact(kaza_words, title_lower) and has_exact(vehicle_words, text_to_check):
@@ -102,7 +102,7 @@ def classify_news(content, title=""):
             return "Trafik Kazası"
 
     # 2. Yangın
-    fire_words = ["yangın", "yangını", "yangında", "yangına", "alevlere teslim", "kül oldu", "kundaklama", "kundaklandı"]
+    fire_words = ["yangın", "yangını", "yangında", "yangına", "alevlere teslim", "kül oldu", "küle döndü", "kundaklama", "kundaklandı", "kundaklayıp", "kundakladı", "alev alev"]
     if has_exact(fire_words, title_lower):
         return "Yangın"
         
@@ -199,5 +199,3 @@ def is_duplicate(new_text, existing_items, threshold=0.90):
     if max_score >= threshold:
         return True, max_score, matched
     return False, max_score, None
-
-

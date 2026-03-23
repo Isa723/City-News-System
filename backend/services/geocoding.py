@@ -65,11 +65,31 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
 
     # 2. Detect District as a fallback or secondary anchor
     districts_found = []
+    district_positions = []
+    
+    # Suffixes: -da, -de, -dan, -den, -ya, -ye, -a, -e, -nın, -nin, -daki, -deki, -ndaki, -ndeki
+    district_suffixes = r'(?:[\'’]?(?:da|de|ta|te|dan|den|tan|ten|ya|ye|a|e|ı|i|u|ü|nın|nin|nun|nün|nda|nde|ndan|nden|na|ne|lı|li|lu|lü|ki|daki|deki|taki|teki|ndaki|ndeki))?\b'
+    
+    title_clean = title.replace('İ', 'i').replace('I', 'ı').lower()
+    
     for district in KOCAELI_DISTRICTS:
         d_lower = district.replace('İ', 'i').replace('I', 'ı').lower()
-        if re.search(r'\b' + re.escape(d_lower) + r'\b', text_clean):
+        pattern = r'\b' + re.escape(d_lower) + district_suffixes
+        
+        # Check if it's in the title first - TITLES get ultimate priority
+        if re.search(pattern, title_clean, re.I):
+            districts_found.insert(0, district) # Put at the front
+            candidates.append(district)
+            district_positions.append((0, district)) # Weight 0 = Title
+            continue
+            
+        # Otherwise search in body
+        match = re.search(pattern, text_clean, re.I)
+        if match:
+            pos = match.start()
             districts_found.append(district)
             candidates.append(district)
+            district_positions.append((pos, district))
 
     # 3. Combine results smartly
     district: Optional[str] = None
@@ -77,7 +97,7 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
     if specific_loc:
         if len(districts_found) == 1 and districts_found[0] != "İzmit":
             district = districts_found[0]
-            best = f"{specific_loc}, {districts_found[0]}, Kocaeli, Turkey"
+            best = f"{specific_loc}, {district}, Kocaeli, Turkey"
         else:
             best = f"{specific_loc}, Kocaeli, Turkey"
 
@@ -87,18 +107,26 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
             "candidates": sorted(set(candidates)),
         }
             
-    if districts_found:
-        if len(districts_found) > 1 and "İzmit" in districts_found:
-            other_districts = [d for d in districts_found if d != "İzmit"]
-            district = other_districts[0]
+    if district_positions:
+        # Sort by position (Title=0, then earliest in text)
+        district_positions.sort(key=lambda x: x[0])
+        
+        # If the earliest one is İzmit, but there is another district right after,
+        # İzmit is often a false positive (center of province/news agency location).
+        # We only apply the İzmit demotion if we found multiple districts.
+        ordered_districts = [d for pos, d in district_positions]
+        
+        if len(ordered_districts) > 1 and ordered_districts[0] == "İzmit":
+            district = ordered_districts[1]
         else:
-            district = districts_found[0]
+            district = ordered_districts[0]
 
         return {
             "best_location_text": f"{district}, Kocaeli, Turkey",
             "district": district,
             "candidates": sorted(set(candidates)),
         }
+        
         
     return None
 

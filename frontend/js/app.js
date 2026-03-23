@@ -83,8 +83,12 @@ function renderMarkers(filteredData) {
         const iconClass = categoryIcons[news.category] || "fa-circle-info";
         const pathData = categoryPaths[news.category] || categoryPaths["Trafik Kazası"];
 
+        // Add a very slight random jitter (~100-200 meters) so markers at the exact same city block don't overlap completely
+        const jitterLat = (Math.random() - 0.5) * 0.004;
+        const jitterLng = (Math.random() - 0.5) * 0.004;
+
         const marker = new google.maps.Marker({
-            position: { lat: news.latitude, lng: news.longitude },
+            position: { lat: news.latitude + jitterLat, lng: news.longitude + jitterLng },
             map: map,
             title: news.title,
             icon: {
