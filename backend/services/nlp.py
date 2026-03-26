@@ -18,63 +18,78 @@ def get_model():
             _model_load_failed = True
     return _model
 
-# PDF Category Definitions and Keywords (Priority order: top to bottom)
-CATEGORIES = {
-    "Trafik Kazası": ["trafik kazası", "zincirleme kaza", "şarampol", "takla attı", "otomobil devrildi", "feci kaza"],
-    "Yangın": ["yangın çıktı", "alevlere teslim", "itfaiye müdahale", "ev yandı", "fabrika yangını", "orman yangını", "çatıda yangın", "yangın"],
-    "Elektrik Kesintisi": ["elektrik kesintisi", "planlı kesinti", "sedaş", "trafo patladı", "elektrikler kesilecek"],
-    "Hırsızlık": ["hırsızlık", "çalındı", "soygun", "gasp", "çaldı", "yankesici"],
-    "Kültürel Etkinlikler": ["konser", "festival", "tiyatro", "sergi", "kitap fuarı", "şenlik", "gösteri", "sinema", "kültür sanat"],
+# Semantic Category Definitions
+CATEGORIES_SEMANTIC = {
+    "Trafik Kazası": "trafik kazası çarpışma zincirleme kaza devrilen araç şarampol feci kaza ölümlü yaralamalı trafik kazası yol kapandı",
+    "Yangın": "yangın alev bina yanması duman itfaiye müdahalesi orman yangını çatı yanması alevlere teslim itfaiye ekipleri",
+    "Hırsızlık": "hırsızlık soygun gasp çalınma hırsız yakalandı ev soyuldu dükkan soygunu yankesicilik dolandırıcılık operasyon",
+    "Elektrik Kesintisi": "elektrik kesintisi enerji yok karanlık trafo arızası ışıklar gitti planlı kesinti sedaş elektrikler yok arıza onarım",
+    "Kültürel Etkinlikler": "festival konser etkinlik tiyatro kutlama sergi kitap fuarı şenlik kültür sanat müze sergisi gösteri"
 }
 
 # Crime/Police operation keywords that should always fall into 'Diğer'
 POLICE_OP_EXCLUSIONS = ["narkotik", "uyuşturucu", "silah", "ele geçirildi", "gözaltı", "operasyon", "sahte para", "asayiş"]
 
 # Municipal / Routine / Political keywords that incorrectly trigger categories
-# E.g. "Başkan iftar davet" should NOT be a "Trafik Kazası" just because it mentions a "street"
 GENERAL_EXCLUSIONS = [
     "iftar", "davet", "başkan", "belediye", "hizmet", "proje", "ziyaret", 
     "açılış", "tören", "kutlama", "bayram", "meclis", "seçim", "parti", 
-    "milletvekili", "valilik", "kaymakam", "program", "buluşma", "sofra"
+    "milletvekili", "valilik", "kaymakam", "program", "buluşma", "sofra",
+    "hizmet binası", "temel atma", "denetim", "inceleme"
 ]
+
+# Legal/Court process exclusions to prevent trials for old crimes being marked as active events
+LEGAL_EXCLUSIONS = [
+    "dava", "mahkeme", "sanık", "duruşma", "hakim", "savcı", "adliye", "avukat", 
+    "yargılama", "hapis cezası", "müebbet", "tahliye", "beraat", "suç duyurusu"
+]
+
+# Global pre-computed embeddings for categories (Loaded lazily)
+_category_embeddings = None
+
+def get_category_embeddings():
+    global _category_embeddings
+    if _category_embeddings is None:
+        model = get_model()
+        if model:
+            categories = list(CATEGORIES_SEMANTIC.keys())
+            descriptions = [CATEGORIES_SEMANTIC[cat] for cat in categories]
+            _category_embeddings = {
+                "categories": categories,
+                "embeddings": model.encode(descriptions, convert_to_tensor=True)
+            }
+    return _category_embeddings
 
 def classify_news(content, title=""):
     """
-    Classifies news by searching for strict keyword boundaries to prevent false positives.
+    Classifies news by comparing content similarity with category descriptions (Semantic AI).
     """
     if not content and not title:
         return "Diğer"
 
-    # Analyze only the Title and the first 400 characters of the body.
-    # This acts as a bulletproof shield against "Related News" widgets or footer menus
-    # that inject words like "Trafik Kazası" or "Yangın" into unrelated articles.
     text_to_check = (title + " " + content[:400]).lower()
-    title_lower = title.lower()
-
-    # Helper: checks if ANY of the exact words/phrases are in the text
-    # Includes common Turkish suffixes (noun cases/plurals) so we don't miss 'otobüsü' while looking for 'otobüs'
+    
+    # helper for exclusion check
     def has_exact(word_list, text):
         suffixes = r'(?:lar|ler)?(?:ı|i|u|ü|a|e|da|de|ta|te|ya|ye|na|ne|nın|nin|nun|nün|dan|den|tan|ten|sı|si|su|sü|yı|yi|yu|yü)?'
         for w in word_list:
-            if ' ' in w: # Compound words/phrases are matched strictly
+            if ' ' in w: 
                 if re.search(r'\b' + re.escape(w) + r'\b', text):
                     return True
-            else: # Single words allow valid Turkish suffixes attached directly to them
+            else:
                 if re.search(r'\b' + re.escape(w) + suffixes + r'\b', text):
                     return True
         return False
 
-    # 0. Global Exclusions (Crime operations, sports, irrelevant daily events, NATIONAL CITIES)
-    exclusions = [
+    # Combined exclusions
+    all_exclusions = [
         "narkotik", "uyuşturucu", "silah ele", "sahte para", "operasyon", "şüpheli", 
-        "iftar", "davet", "belediye başkanı", "ziyaret", "açılış", "tören", 
-        "kutlama", "bayram", "meclis toplantısı", "milletvekili", 
+        "belediye başkanı", "meclis toplantısı", "milletvekili", 
         "antrenman", "turnuva", "müsabaka", "şampiyona", "spor", "idman", "kupa",
         "fenomen", "sosyal medya", "tutuklama", "gözaltı", "darbe", "yakalandı", 
         "ihraç", "terör", "firari", "cezaevi", "hapis", "emniyet", "polis"
-    ]
+    ] + GENERAL_EXCLUSIONS + LEGAL_EXCLUSIONS
     
-    # NATIONAL CITIES (Exclude completely to satisfy "Yalnızca Kocaeli" rule)
     national_cities = [
         "adana", "ankara", "antalya", "aydın", "balıkesir", "bursa", "diyarbakır", 
         "erzurum", "eskişehir", "gaziantep", "hatay", "mersin", "istanbul", "izmir", 
@@ -82,62 +97,48 @@ def classify_news(content, title=""):
         "ordu", "samsun", "şanlıurfa", "tekirdağ", "trabzon", "van"
     ]
     
-    if has_exact(exclusions, title_lower) or has_exact(national_cities, title_lower):
-        if not has_exact(["konser", "festival", "tiyatro", "sergi"], title_lower):
+    if has_exact(all_exclusions, title.lower()) or has_exact(national_cities, title.lower()):
+        # Exception for cultural events that might contain exclusion words
+        if not has_exact(["konser", "festival", "tiyatro", "sergi"], title.lower()):
             return "Diğer"
 
-    # Require strong keywords specifically in TITLE to bypass footer/menu pollution in content
-    # OR require highly unique words in content
+    # 1. Follow-up / Retrospective Filtering (News about things that already happened)
+    # E.g. "Yangında evi yanan çifte ev yapıldı" -> Not a 'Fire' event.
+    follow_up_indicators = [
+        "yeniden kuruldu", "ev yapıldı", "yardım eli", "ziyaret etti", "ziyaret", 
+        "geçmiş olsun", "onarıldı", "yardım yapıldı", "destek verildi", "teslim edildi",
+        "yıldönümü", "anıldı", "anma"
+    ]
+    if has_exact(follow_up_indicators, text_to_check):
+        return "Diğer"
+
+    # AI-based Semantic Categorization
+    model = get_model()
+    cat_data = get_category_embeddings()
     
-    # 1. Trafik Kazası
-    traffic_exact = ["trafik kazası", "zincirleme", "şarampol", "takla attı", "feci kaza", "araç takla", "direksiyon hakimiyet", "direksiyon hakimiyetini", "motor kazası"]
-    if has_exact(traffic_exact, title_lower) or has_exact(traffic_exact, text_to_check):
-        return "Trafik Kazası"
-        
-    kaza_words = ["kaza", "kazası", "kazada", "kazaya", "çarpıştı", "devrildi", "çarptı", "çarptığı", "ezdi"]
-    vehicle_words = ["araç", "aracı", "araçlar", "araçta", "otomobil", "kamyon", "tır", "motosiklet", "bisiklet", "minibüs", "otobüs"]
-    
-    if has_exact(kaza_words, title_lower) and has_exact(vehicle_words, text_to_check):
-        if not has_exact(["iş kazası", "görünmez kaza", "iş cinayeti"], text_to_check):
-            return "Trafik Kazası"
+    if model and cat_data:
+        try:
+            from sentence_transformers import util
+            text_emb = model.encode(text_to_check, convert_to_tensor=True)
+            scores = util.cos_sim(text_emb, cat_data["embeddings"])[0]
+            
+            max_idx = int(scores.argmax().item())
+            max_score = float(scores[max_idx].item())
+            
+            # Confidence Threshold for categorization
+            # Stricter thresholds based on user feedback
+            threshold = 0.35 
+            if cat_data["categories"][max_idx] == "Trafik Kazası":
+                threshold = 0.45
+            elif cat_data["categories"][max_idx] == "Hırsızlık":
+                threshold = 0.40 # Higher threshold to avoid false positives like court cases
+            
+            if max_score > threshold:
+                return cat_data["categories"][max_idx]
+        except Exception as e:
+            print(f"Semantic classification failed: {e}")
 
-    # 2. Yangın
-    fire_words = ["yangın", "yangını", "yangında", "yangına", "alevlere teslim", "kül oldu", "küle döndü", "kundaklama", "kundaklandı", "kundaklayıp", "kundakladı", "alev alev"]
-    if has_exact(fire_words, title_lower):
-        return "Yangın"
-        
-    # If "itfaiye" is in text, it might just be a rescue (e.g. falling from window)
-    if has_exact(["itfaiye", "yangın"], text_to_check):
-        if has_exact(fire_words, title_lower) or "alev" in title_lower:
-            return "Yangın"
-        # If no fire words in title, it's highly prone to false positives from menus. Reject.
-        
-    # 3. Diğer Kategoriler (Elektrik, Hırsızlık, Kültürel Etkinlikler)
-    OTHER_CATEGORIES = {
-        "Elektrik Kesintisi": [
-            "elektrik kesintisi", "planlı kesinti", "sedaş", "trafo patladı", "elektrikler kesilecek", "elektrik kesilecek", "elektrik arızası"
-        ],
-        "Hırsızlık": [
-            "hırsızlık", "soygun", "gasp", "yankesici", "kuyumcu soygunu"
-        ],
-        "Kültürel Etkinlikler": [
-            "konser", "festival", "tiyatro", "sergi", "kitap fuarı", "şenlik", "gösteri", "sinema", "kültür sanat", "etkinlik", "söyleşi"
-        ]
-    }
-
-    # Title match gets absolute priority
-    for category, keywords in OTHER_CATEGORIES.items():
-        if has_exact(keywords, title_lower):
-            return category
-
-    # Very strict content fallback for specific events
-    for category, keywords in OTHER_CATEGORIES.items():
-        if has_exact(keywords, text_to_check):
-            # To prevent random menu matches, only allow if the keyword is uniquely descriptive
-            if category == "Elektrik Kesintisi" and has_exact(["elektrik kesintisi", "sedaş"], text_to_check):
-                return category
-            if category == "Hırsızlık" and has_exact(["soygun", "gasp", "yankesici"], text_to_check):
-                return category
+    return "Diğer"
 
     return "Diğer"
 
@@ -166,36 +167,60 @@ def check_similarity(text1, text2):
 def is_duplicate(new_text, existing_items, threshold=0.90):
     """
     Checks if a new_text is at least 90% similar to ANY existing text.
-    existing_items can be either:
-    - list[str] (legacy)
-    - list[dict] containing {"_id": ..., "content": "..."}
-    Returns (True, max_score, matched) where matched is either the matched text (legacy)
-    or the matched document _id (preferred).
     """
     if not existing_items:
         return False, 0.0, None
         
-    max_score = 0.0
-    matched = None
-
     legacy_mode = isinstance(existing_items[0], str)
 
-    for item in existing_items:
-        if legacy_mode:
-            ext_text = item
-            ext_id = None
-        else:
-            ext_text = item.get("content") or ""
-            ext_id = item.get("_id")
+    # Legacy slow path kept for safety.
+    if legacy_mode:
+        max_score = 0.0
+        matched = None
+        for ext_text in existing_items:
+            if not ext_text:
+                continue
+            score = check_similarity(new_text, ext_text)
+            if score > max_score:
+                max_score = score
+                matched = ext_text
+        if max_score >= threshold:
+            return True, max_score, matched
+        return False, max_score, None
 
+    # Optimized path: compute embeddings once, compare in batch.
+    model = get_model()
+    if not model or not new_text:
+        return False, 0.0, None
+
+    try:
+        from sentence_transformers import util
+    except Exception:
+        return False, 0.0, None
+
+    ext_texts: list[str] = []
+    ext_ids: list = []
+    for item in existing_items:
+        if not item:
+            continue
+        ext_text = item.get("content") or ""
         if not ext_text:
             continue
+        ext_texts.append(ext_text)
+        ext_ids.append(item.get("_id"))
 
-        score = check_similarity(new_text, ext_text)
-        if score > max_score:
-            max_score = score
-            matched = ext_text if legacy_mode else ext_id
-            
+    if not ext_texts:
+        return False, 0.0, None
+
+    # Batch encoding massively reduces runtime vs per-item similarity.
+    new_emb = model.encode(new_text, convert_to_tensor=True)
+    existing_emb = model.encode(ext_texts, convert_to_tensor=True)
+    scores = util.cos_sim(new_emb, existing_emb)[0]
+
+    max_idx = int(scores.argmax().item())
+    max_score = float(scores[max_idx].item())
+    matched_id = ext_ids[max_idx]
+
     if max_score >= threshold:
-        return True, max_score, matched
+        return True, max_score, matched_id
     return False, max_score, None

@@ -24,6 +24,43 @@ function initMap() {
     loadNews();
 }
 
+// Required by Google Maps callback when script is loaded dynamically.
+window.initMap = initMap;
+
+async function bootstrapGoogleMaps() {
+    try {
+        const cfgRes = await fetch('/api/config');
+        const cfg = await cfgRes.json();
+        const apiKey = (cfg.googleMapsJsApiKey || "").trim();
+
+        if (!apiKey) {
+            const mapEl = document.getElementById("map");
+            if (mapEl) {
+                mapEl.innerHTML = '<div style="padding:16px;font-family:Inter,Arial,sans-serif;color:#8b949e;">Google Maps JS API anahtari eksik. Lutfen proje kokunde .env dosyasini olusturup `GOOGLE_MAPS_JS_API_KEY` (veya `GOOGLE_MAPS_API_KEY`) degerini ekleyin.</div>';
+            }
+            return;
+        }
+
+        const script = document.createElement("script");
+        script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&callback=initMap`;
+        script.defer = true;
+        script.async = true;
+        script.onerror = () => {
+            const mapEl = document.getElementById("map");
+            if (mapEl) {
+                mapEl.innerHTML = '<div style="padding:16px;font-family:Inter,Arial,sans-serif;color:#8b949e;">Google Maps yuklenemedi. API anahtari veya ag baglantisini kontrol edin.</div>';
+            }
+        };
+        document.head.appendChild(script);
+    } catch (error) {
+        console.error("Failed to bootstrap Google Maps:", error);
+        const mapEl = document.getElementById("map");
+        if (mapEl) {
+            mapEl.innerHTML = '<div style="padding:16px;font-family:Inter,Arial,sans-serif;color:#8b949e;">Harita baslatilirken bir hata olustu.</div>';
+        }
+    }
+}
+
 // Icon mapping for FontAwesome symbols
 const categoryIcons = {
     "Trafik Kazası": "fa-car-burst",
@@ -162,10 +199,10 @@ function applyFilters() {
         cutoffDate = todayStart;
     } else if (dateRange === '2') {
         cutoffDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+        cutoffDate.setHours(0, 0, 0, 0);
     } else if (dateRange === '3') {
         cutoffDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 2);
-    } else if (dateRange === '4' || dateRange === 'all') {
-        cutoffDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 3);
+        cutoffDate.setHours(0, 0, 0, 0);
     }
 
     const filteredData = allNewsData.filter(news => {
@@ -204,13 +241,30 @@ triggerScraperBtn.addEventListener('click', async () => {
 
     try {
         const response = await fetch('/api/scrape', { method: 'POST' });
-        await response.json();
+        const data = await response.json();
 
-        setTimeout(() => {
-            icon.classList.remove('fa-spin');
-            triggerScraperBtn.disabled = false;
-            loadNews();
-        }, 3000);
+        if (data.status === 'already_running') {
+            alert("Tarama zaten devam ediyor. Lütfen bekleyin.");
+            return;
+        }
+
+        // Poll for status
+        const pollInterval = setInterval(async () => {
+            try {
+                const statusRes = await fetch('/api/scrape/status');
+                const statusData = await statusRes.json();
+
+                if (statusData.status === 'finished' || statusData.status === 'idle') {
+                    clearInterval(pollInterval);
+                    icon.classList.remove('fa-spin');
+                    triggerScraperBtn.disabled = false;
+                    loadNews(); // Finally load the fresh news
+                }
+            } catch (e) {
+                console.error("Status check failed:", e);
+            }
+        }, 2000);
+
     } catch (error) {
         console.error("Error triggering scraper:", error);
         icon.classList.remove('fa-spin');
@@ -218,8 +272,8 @@ triggerScraperBtn.addEventListener('click', async () => {
     }
 });
 
-// Theme bootstrap
 document.addEventListener('DOMContentLoaded', () => {
     const savedTheme = localStorage.getItem('theme') || 'light';
     document.documentElement.setAttribute('data-theme', savedTheme);
+    bootstrapGoogleMaps();
 });

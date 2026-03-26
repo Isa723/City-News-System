@@ -7,6 +7,7 @@ Category = Literal[
     "Elektrik Kesintisi",
     "Hırsızlık",
     "Kültürel Etkinlikler",
+    "Gündem",
     "Diğer",
 ]
 

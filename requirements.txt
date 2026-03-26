@@ -9,3 +9,4 @@ python-dotenv
 googlemaps
 sentence-transformers
 torch
+stanza

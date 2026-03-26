@@ -13,6 +13,7 @@
     --cat-elektrik: #00bcd4; /* Cyan for Power */
     --cat-hirsizlik: #9c27b0; /* Purple for Theft */
     --cat-kulturel: #4caf50; /* Green for Cultural */
+    --cat-gundem: #607d8b; /* Blue-gray for Gündem */
     --cat-other: #707070; /* Gray for Other */
 }
 
@@ -282,6 +283,7 @@ body {
 .cat-elektrik { background: rgba(0, 188, 212, 0.2); color: var(--cat-elektrik); }
 .cat-hirsizlik { background: rgba(156, 39, 176, 0.2); color: var(--cat-hirsizlik); }
 .cat-kulturel { background: rgba(76, 175, 80, 0.2); color: var(--cat-kulturel); }
+.cat-gundem { background: rgba(96, 125, 139, 0.2); color: var(--cat-gundem); }
 .cat-other { background: rgba(112, 112, 112, 0.2); color: var(--text-muted); }
 
 .popup-title {

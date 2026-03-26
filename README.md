@@ -3,7 +3,16 @@
 Bu proje, **Kocaeli yerel haber sitelerinden** (PDF’de verilen 5 kaynak) son haberleri otomatik çekip **MongoDB**’ye kaydeder; haber türünü sınıflandırır, metinden konum çıkarır, **Google Geocoding** ile koordinat üretir ve **Google Maps** üzerinde görselleştirir.
 
 ## Özellikler (PDF ile uyumlu)
-- **Kaynaklar**: Çağdaş Kocaeli, Özgür Kocaeli, Ses Kocaeli, Yeni Kocaeli, Bizim Yaka (RSS + detay sayfa içerik çekimi)\n- **Zaman aralığı**: Varsayılan **son 3 gün**; UI’da tarih aralığı seçip filtreleyebilirsiniz\n- **Alanlar**: kategori, başlık, içerik, yayın tarihi, konum metni + lat/lng, ilçe, kaynak(lar) ve link(ler)\n- **Dedup**:\n  - Aynı URL tekrar kaydedilmez\n  - Farklı sitelerde aynı içerik: embedding benzerliği **≥ 0.90** ise tek haber olarak tutulur ve **sources[]** listesine eklenir\n- **Konum**: Metinden mahalle/cadde/sokak/ilçe adayları çıkarılır, bulunamazsa haber haritada gösterilmez\n- **Geocoding**: API anahtarı `.env` ile saklanır; gereksiz tekrarlar için **MongoDB geocache** kullanılır\n- **Harita**: Kocaeli merkez; kategoriye göre farklı renk/sembol; marker tıklayınca başlık/tarih/konum/kaynaklar + “Habere Git”\n- **Dinamik filtre**: sayfa yenilenmeden marker’lar güncellenir\n+
+- **Kaynaklar**: Çağdaş Kocaeli, Özgür Kocaeli, Ses Kocaeli, Yeni Kocaeli, Bizim Yaka (RSS + detay sayfa içerik çekimi)
+- **Zaman aralığı**: Varsayılan **son 3 gün**; UI'da tarih aralığı seçip filtreleyebilirsiniz
+- **Alanlar**: kategori, başlık, içerik, yayın tarihi, konum metni + lat/lng, ilçe, kaynak(lar) ve link(ler)
+- **Dedup**:
+  - Aynı URL tekrar kaydedilmez
+  - Farklı sitelerde aynı içerik: embedding benzerliği **>= 0.90** ise tek haber olarak tutulur ve **sources[]** listesine eklenir
+- **Konum**: Metinden mahalle/cadde/sokak/ilçe adayları çıkarılır, bulunamazsa haber haritada gösterilmez
+- **Geocoding**: API anahtarı `.env` ile saklanır; gereksiz tekrarlar için **MongoDB geocache** kullanılır
+- **Harita**: Kocaeli merkez; kategoriye göre farklı renk/sembol; marker tıklayınca başlık/tarih/konum/kaynaklar + "Habere Git"
+- **Dinamik filtre**: sayfa yenilenmeden marker'lar güncellenir
 ## Kurulum
 
 ### 1) Sanal ortam ve bağımlılıklar
@@ -44,7 +53,8 @@ SCRAPE_ON_STARTUP=true
 Arayüz: `http://localhost:8000/app`
 
 ### Manuel scraping
-- UI’daki **“Yeni Haberleri Çek”** butonu `POST /api/scrape` çağırır.\n- İsterseniz tarih aralığına göre: UI tarih alanlarını seçip butona basın (backend `--date-from/--date-to` ile runner’ı çağırır).
+- UI'daki **"Yeni Haberleri Çek"** butonu `POST /api/scrape` çağırır.
+- İsterseniz tarih aralığına göre: UI tarih alanlarını seçip butona basın (backend `--date-from/--date-to` ile runner'ı çağırır).
 
 ### Scraper’ı terminalden çalıştırma
 
@@ -59,5 +69,7 @@ Tarih aralığı ile:
 ```
 
 ## API
-- `GET /api/news?category=...&district=...&source=...&date_from=...&date_to=...`\n- `POST /api/scrape?date_from=...&date_to=...`\n- `GET /api/config` (frontend bootstrap için)
+- `GET /api/news?category=...&district=...&source=...&date_from=...&date_to=...`
+- `POST /api/scrape?date_from=...&date_to=...`
+- `GET /api/config` (frontend bootstrap için)
 

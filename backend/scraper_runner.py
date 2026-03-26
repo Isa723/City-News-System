@@ -28,13 +28,19 @@ async def run_pipeline(date_from: str | None = None, date_to: str | None = None)
     raw_news_list = await scrape_all_sources(date_from=date_from, date_to=date_to)
     print(f"✅ Found {len(raw_news_list)} recent news items in total.")
     
-    # Fetch recent existing records for duplicate checking (keep it efficient).
+    # Fetch recent existing records for semantic duplicate checking.
+    # Keep it bounded for speed; requirement is semantic dedup, not exhaustive history scan.
     now = datetime.now(timezone.utc)
-    seven_days_ago = (now - timedelta(days=7)).isoformat()
+    three_days_ago = (now - timedelta(days=3)).isoformat()
     existing_records = await news_collection.find(
-        {"publish_date": {"$gte": seven_days_ago}},
-        {"content": 1},
-    ).to_list(length=None)
+        {"publish_date": {"$gte": three_days_ago}},
+        {"content": 1, "category": 1},
+    ).sort("publish_date", -1).limit(400).to_list(length=None)
+
+    existing_records_by_category: dict[str, list[dict]] = {}
+    for rec in existing_records:
+        cat = rec.get("category") or "Diğer"
+        existing_records_by_category.setdefault(cat, []).append(rec)
     
     saved_count = 0
     
@@ -50,25 +56,23 @@ async def run_pipeline(date_from: str | None = None, date_to: str | None = None)
             # We already have this exact article from this source
             continue
             
-        # 2. Prevent Semantic Duplicates (%90 Similarity)
-        # Requirement: "Farklı haber kaynaklarında yer alan ancak içerik olarak aynı olan 
-        # haberler tek bir haber olarak değerlendirilmelidir. Haber kaynaklarının tümü listelenmelidir."
-        print(f"🧠 Checking '{title}' for semantic duplicates...")
-        duplicate, score, matched_id = is_duplicate(content, existing_records)
-        
-        if duplicate:
+        # 2. Classify first (fast) to avoid expensive semantic dedup for irrelevant items.
+        category = classify_news(content, title=title)
+        if category == "Diğer":
+            continue
+
+        # 3. Prevent Semantic Duplicates (%90 Similarity)
+        # Compare only within same category to keep it fast.
+        compare_items = existing_records_by_category.get(category, [])
+        print(f"🧠 Checking '{title[:60]}...' for semantic duplicates ({category})...")
+        duplicate, score, matched_id = is_duplicate(content, compare_items)
+
+        if duplicate and matched_id is not None:
             print(f"   🔗 Duplicate found ({score*100:.1f}%), adding {source_name} to sources list.")
             await news_collection.update_one(
                 {"_id": matched_id},
-                {"$addToSet": {"sources": {"name": source_name, "url": url}}}
+                {"$addToSet": {"sources": {"name": source_name, "url": url}}},
             )
-            continue
-            
-        # 3. Classify News (Trafik, Yangın vs. - passing title for priority)
-        category = classify_news(content, title=title)
-        # Skip unrelated categories to keep DB focused on required types
-        if category == "Diğer":
-            print(f"   [!] Category 'Diğer' for '{title[:60]}...' -> skipping.")
             continue
         
         # Prepare item for insertion with sources list
@@ -81,34 +85,27 @@ async def run_pipeline(date_from: str | None = None, date_to: str | None = None)
         }
         
         # 4. Extract Location (structured) and Geocode
-        # STRICT KOCAELI REQUIREMENT (PDF Section 2: Yalnızca Kocaeli)
-        KOCAELI_KEYWORDS = ["kocaeli", "izmit", "gebze", "gölcük", "derince", "darıca", "körfez", "kartepe", "başiskele", "karamürsel", "kandıra", "dilovası", "çayırova"]
-        safe_content = content[:500].lower()
-        
-        if not any(k in safe_content or k in title.lower() for k in KOCAELI_KEYWORDS):
-            print(f"   [!] Non-Kocaeli national news detected ('{title}'). Skipping.")
-            continue
-
         loc_info = extract_location_info(title, content)
-        if not loc_info:
+        if loc_info:
+            location_text = loc_info["best_location_text"]
+            lat, lng = await get_coordinates(db, location_text)
+            db_item['location_text'] = location_text
+            db_item['district'] = loc_info.get("district")
+            db_item['location_candidates'] = loc_info.get("candidates", [])
+            db_item['latitude'] = lat
+            db_item['longitude'] = lng
+            if lat is None or lng is None:
+                print(f"   [!] Geocoding failed for '{location_text}'. Skipping.")
+                continue
+        else:
             print(f"   [!] No location found for '{title}'. Skipping.")
             continue
-
-        location_text = loc_info["best_location_text"]
-        lat, lng = await get_coordinates(db, location_text)
-        if lat is None or lng is None:
-            print(f"   [!] Geocoding failed for '{location_text}'. Skipping.")
-            continue
-            
-        db_item['location_text'] = location_text
-        db_item['district'] = loc_info.get("district")
-        db_item['location_candidates'] = loc_info.get("candidates", [])
-        db_item['latitude'] = lat
-        db_item['longitude'] = lng
             
         # 5. Save to MongoDB
-        await news_collection.insert_one(db_item)
-        existing_records.append({"_id": None, "content": content})
+        inserted = await news_collection.insert_one(db_item)
+        existing_records_by_category.setdefault(category, []).append(
+            {"_id": inserted.inserted_id, "content": content}
+        )
         saved_count += 1
         print(f"   ✅ Saved: [{category}] {title}")
         

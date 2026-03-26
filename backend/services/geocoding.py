@@ -4,6 +4,7 @@ import asyncio
 import googlemaps
 import os
 import re
+# import stanza  # Moved to lazy loading in get_stanza_nlp to prevent top-level ModuleNotFoundError
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
@@ -15,7 +16,35 @@ load_dotenv()
 # Initialize Google Maps Client
 # Mandatory Requirement (Section 7): "API anahtarı güvenli biçimde saklanmalıdır."
 API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
-gmaps = googlemaps.Client(key=API_KEY)
+_gmaps_client = None
+
+
+def get_gmaps_client():
+    global _gmaps_client
+    if _gmaps_client is not None:
+        return _gmaps_client
+    if not API_KEY:
+        return None
+    try:
+        _gmaps_client = googlemaps.Client(key=API_KEY)
+        return _gmaps_client
+    except Exception as e:
+        print(f"Google Maps client init failed: {e}")
+        return None
+
+# Global Stanza Pipeline (Loaded lazily to save memory/startup time)
+_stanza_nlp = None
+
+def get_stanza_nlp():
+    global _stanza_nlp
+    if _stanza_nlp is None:
+        try:
+            import stanza
+            # Only load 'tokenize' and 'ner' processors for speed
+            _stanza_nlp = stanza.Pipeline("tr", processors='tokenize,ner', download_method=None)
+        except (ImportError, Exception) as e:
+            print(f"Stanza initialization failed or module not found: {e}")
+    return _stanza_nlp
 
 def _cache_key(location_name: str) -> str:
     return re.sub(r"\s+", " ", (location_name or "").strip().lower())
@@ -63,7 +92,22 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
         if specific_loc is not None:
             break
 
-    # 2. Detect District as a fallback or secondary anchor
+    # 2. Use Stanza NER to find LOC entities (AI-based extraction)
+    nlp = get_stanza_nlp()
+    if nlp:
+        try:
+            doc = nlp(search_text)
+            for ent in doc.ents:
+                if ent.type == "LOC":
+                    loc_name = ent.text
+                    # Avoid very short or junk entities
+                    if len(loc_name) > 2 and not any(junk in loc_name.lower() for junk in ["haber", "sayfa", "site"]):
+                        if loc_name not in candidates:
+                            candidates.append(loc_name)
+        except Exception as e:
+            print(f"Stanza NER extraction failed: {e}")
+
+    # 3. Detect District as a fallback or secondary anchor (Keep for strict Kocaeli validation)
     districts_found = []
     district_positions = []
     
@@ -79,7 +123,8 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
         # Check if it's in the title first - TITLES get ultimate priority
         if re.search(pattern, title_clean, re.I):
             districts_found.insert(0, district) # Put at the front
-            candidates.append(district)
+            if district not in candidates:
+                candidates.append(district)
             district_positions.append((0, district)) # Weight 0 = Title
             continue
             
@@ -88,12 +133,14 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
         if match:
             pos = match.start()
             districts_found.append(district)
-            candidates.append(district)
+            if district not in candidates:
+                candidates.append(district)
             district_positions.append((pos, district))
 
-    # 3. Combine results smartly
+    # 4. Combine results smartly
     district: Optional[str] = None
 
+    # If we found a specific address part (Mahalle/Sokak) via regex, it's very high confidence
     if specific_loc:
         if len(districts_found) == 1 and districts_found[0] != "İzmit":
             district = districts_found[0]
@@ -106,14 +153,12 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
             "district": district,
             "candidates": sorted(set(candidates)),
         }
-            
+    
+    # If no specific_loc but we have NER LOC candidates
+    # We filter them to ensure they are likely in Kocaeli by checking if a district is also present
     if district_positions:
         # Sort by position (Title=0, then earliest in text)
         district_positions.sort(key=lambda x: x[0])
-        
-        # If the earliest one is İzmit, but there is another district right after,
-        # İzmit is often a false positive (center of province/news agency location).
-        # We only apply the İzmit demotion if we found multiple districts.
         ordered_districts = [d for pos, d in district_positions]
         
         if len(ordered_districts) > 1 and ordered_districts[0] == "İzmit":
@@ -121,12 +166,31 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
         else:
             district = ordered_districts[0]
 
+        # Check if any NER candidate looks like it belongs to this district
+        # Otherwise just use the district
+        best_loc = f"{district}, Kocaeli, Turkey"
+        
+        # If the earliest LOC from Stanza isn't the district itself, use it as a specific location
+        # but only if it's not a known district (to avoid redundancy like "Gebze, Gebze")
+        for cand in candidates:
+            if cand not in KOCAELI_DISTRICTS and cand not in districts_found:
+                # High probability this is a Mahalle or specific place in the district
+                best_loc = f"{cand}, {district}, Kocaeli, Turkey"
+                break
+
         return {
-            "best_location_text": f"{district}, Kocaeli, Turkey",
+            "best_location_text": best_loc,
             "district": district,
             "candidates": sorted(set(candidates)),
         }
         
+    # Final fallback: If NER found something but no district was matched, still try it with Kocaeli anchor
+    if candidates:
+        return {
+            "best_location_text": f"{candidates[0]}, Kocaeli, Turkey",
+            "district": None,
+            "candidates": sorted(set(candidates)),
+        }
         
     return None
 
@@ -141,6 +205,11 @@ async def get_coordinates(db: AsyncIOMotorDatabase, location_name: str) -> Tuple
 
     if not API_KEY:
         print("GOOGLE_MAPS_API_KEY is missing; cannot geocode.")
+        return None, None
+
+    gmaps = get_gmaps_client()
+    if gmaps is None:
+        print("Google Maps client is unavailable; cannot geocode.")
         return None, None
 
     key = _cache_key(location_name)

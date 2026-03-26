@@ -71,10 +71,9 @@
                 <div class="form-group">
                     <label>Tarih</label>
                     <select id="dateFilter" class="glass-input">
-                        <option value="1">son 1 gun</option>
-                        <option value="2">son 2 gun</option>
-                        <option value="3">son 3 gun</option>
-                        <option value="4" selected>son 4 gun</option>
+                        <option value="1">Bugün (1 Gün)</option>
+                        <option value="2">Bugün ve Dün (2 Gün)</option>
+                        <option value="3" selected>Son 3 Gün</option>
                     </select>
                 </div>
                 
@@ -100,9 +99,7 @@
         
     </div>
 
-    <!-- Google Maps JS API (use your key here) -->
-    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyC_4VYXludmLl5bt2m_lxKI-M_gY6Arb4Q&callback=initMap" defer></script>
-    <!-- Custom Logic -->
+    <!-- Custom Logic (loads Google Maps JS dynamically via /api/config) -->
     <script src="js/app.js"></script>
 </body>
 </html>
