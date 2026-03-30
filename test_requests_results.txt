@@ -1,0 +1,42 @@
+﻿.venv\Scripts\python : 
+C:\Users\PISHTAAZ SOFTWARE\Desktop\Pro
+ject\test_simple_requests.py:3: 
+SyntaxWarning: "\S" is an invalid 
+escape sequence. Such sequences will 
+not work in the future. Did you mean 
+"\\S"? A raw string is also an option.
+At line:1 char:1
++ .venv\Scripts\python 
+test_simple_requests.py 2>&1 | 
+Out-File -Encodin ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~
+    + CategoryInfo          : 
+NotSpecifi    ed: 
+(C:\Users\PISHTA...also an optio    
+n.:String) [], RemoteException
+    + FullyQualifiedErrorId : 
+NativeComm    andError
+ 
+  Run: .venv\Scripts\python 
+test_simple_requests.py
+URL                                            STATUS  PREVIEW
+------------------------------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\PISHTAAZ SOFTWARE\Des
+ktop\Project\test_simple_requests.py",
+ line 67, in <module>
+    print(f"{label:<45} 
+{str(status):>7}  {preview}")
+    ~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^
+  File "C:\Python314\Lib\encodings\cp1
+252.py", line 19, in encode
+    return codecs.charmap_encode(input
+,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec 
+can't encode character '\u011f' in 
+position 2: character maps to 
+<undefined>

@@ -1,12 +1,14 @@
 fastapi
 uvicorn[standard]
 motor
-feedparser
+seleniumbase
 requests
 beautifulsoup4
 lxml
 python-dotenv
 googlemaps
 sentence-transformers
+transformers
 torch
 stanza
+pytz

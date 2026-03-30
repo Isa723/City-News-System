@@ -1,8 +1,9 @@
 import argparse
 import asyncio
 from datetime import datetime, timedelta, timezone
+
 from motor.motor_asyncio import AsyncIOMotorClient
-from services.scraper import scrape_all_sources
+from services.scraper import scrape_all_sources, default_last_three_calendar_days_iso
 from services.nlp import classify_news, is_duplicate
 from services.geocoding import extract_location_info, get_coordinates
 
@@ -11,20 +12,15 @@ client = AsyncIOMotorClient(MONGO_URL)
 db = client.kocaeli_news
 news_collection = db.news
 
-def _default_date_range_iso():
-    now = datetime.now(timezone.utc)
-    date_to = now.isoformat()
-    date_from = (now - timedelta(days=3)).isoformat()
-    return date_from, date_to
-
-
 async def run_pipeline(date_from: str | None = None, date_to: str | None = None):
     print("🚀 Starting the unified Scraper -> NLP -> Map Pipeline...")
     
-    # 1. Scrape all raw news from 5 sites (last 3 days)
-    print("⏳ Fetching RSS feeds and parsing HTML...")
+    # 1. Scrape all raw news from 5 sites (today + yesterday + day before, Istanbul calendar)
+    print("⏳ Fetching listing pages and article HTML...")
     if not date_from and not date_to:
-        date_from, date_to = _default_date_range_iso()
+        date_from, date_to = default_last_three_calendar_days_iso()
+    window_start = datetime.fromisoformat(date_from.replace("Z", "+00:00")).astimezone(timezone.utc)
+    window_end = datetime.fromisoformat(date_to.replace("Z", "+00:00")).astimezone(timezone.utc)
     raw_news_list = await scrape_all_sources(date_from=date_from, date_to=date_to)
     print(f"✅ Found {len(raw_news_list)} recent news items in total.")
     
@@ -49,6 +45,14 @@ async def run_pipeline(date_from: str | None = None, date_to: str | None = None)
         title = item['title']
         source_name = item['source']
         url = item['url']
+
+        pub = datetime.fromisoformat(item["publish_date"].replace("Z", "+00:00"))
+        if pub.tzinfo is None:
+            pub = pub.replace(tzinfo=timezone.utc)
+        else:
+            pub = pub.astimezone(timezone.utc)
+        if not (window_start <= pub <= window_end):
+            continue
         
         # 2. Prevent Exact Duplicates (Check if this URL is already in any source list)
         exists = await news_collection.find_one({"sources.url": url})
@@ -86,19 +90,19 @@ async def run_pipeline(date_from: str | None = None, date_to: str | None = None)
         
         # 4. Extract Location (structured) and Geocode
         loc_info = extract_location_info(title, content)
-        if loc_info:
-            location_text = loc_info["best_location_text"]
-            lat, lng = await get_coordinates(db, location_text)
-            db_item['location_text'] = location_text
-            db_item['district'] = loc_info.get("district")
-            db_item['location_candidates'] = loc_info.get("candidates", [])
-            db_item['latitude'] = lat
-            db_item['longitude'] = lng
-            if lat is None or lng is None:
-                print(f"   [!] Geocoding failed for '{location_text}'. Skipping.")
-                continue
-        else:
-            print(f"   [!] No location found for '{title}'. Skipping.")
+        if not loc_info:
+            print(f"   [skip] No map-safe location: {title[:55]}...")
+            continue
+        location_text = loc_info["best_location_text"]
+        lat, lng = await get_coordinates(db, location_text)
+        db_item["location_text"] = location_text
+        db_item["district"] = loc_info.get("district")
+        db_item["location_candidates"] = loc_info.get("candidates", [])
+        db_item["latitude"] = lat
+        db_item["longitude"] = lng
+
+        if db_item.get('latitude') is None:
+            print(f"   [!] Geocoding failed for article. Skipping.")
             continue
             
         # 5. Save to MongoDB

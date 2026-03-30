@@ -56,6 +56,87 @@ KOCAELI_DISTRICTS = [
     "Kandıra", "Dilovası", "Çayırova"
 ]
 
+# Provinces / major cities outside Kocaeli (ASCII-folded keys; see _fold_tr).
+OTHER_TURKEY_PLACES = frozenset(
+    {
+        "batman", "diyarbakir", "mardin", "sirnak", "hakkari", "van", "mus", "bingol", "elazig",
+        "tunceli", "erzincan", "agri", "kars", "ardahan", "igdir", "bitlis", "siirt", "sanliurfa",
+        "gaziantep", "kahramanmaras", "adiyaman", "osmaniye", "kilis", "hatay", "antakya",
+        "iskenderun", "malatya", "sivas", "tokat", "amasya", "sinop", "rize", "trabzon",
+        "giresun", "ordu", "samsun", "zonguldak", "bolu", "edirne", "kirklareli", "tekirdag",
+        "canakkale", "balikesir", "manisa", "aydin", "mugla", "antalya", "isparta", "burdur",
+        "denizli", "afyon", "usak", "kutahya", "bursa", "yalova", "sakarya", "duzce", "bartin",
+        "kastamonu", "corum", "yozgat", "nevsehir", "kirsehir", "kirikkale", "ankara", "konya",
+        "eskisehir", "kayseri", "nigde", "aksaray", "karaman", "mersin", "adana", "istanbul",
+        "izmir", "bodrum", "fethiye",
+    }
+)
+
+
+def _fold_tr(s: str) -> str:
+    """ASCII-style fold so Balıkesir/balikesir/balıkesir all match."""
+    x = _norm_for_place(s)
+    for a, b in (
+        ("ı", "i"),
+        ("ğ", "g"),
+        ("ü", "u"),
+        ("ş", "s"),
+        ("ö", "o"),
+        ("ç", "c"),
+    ):
+        x = x.replace(a, b)
+    return x
+
+
+def _norm_for_place(s: str) -> str:
+    return (
+        s.replace("İ", "i")
+        .replace("I", "ı")
+        .lower()
+        .replace("’", "'")
+        .replace("`", "'")
+    )
+
+
+def _mentions_kocaeli_context(title: str, text: str) -> bool:
+    blob = _norm_for_place(title + " " + text[:400])
+    if "kocaeli" in blob:
+        return True
+    for d in KOCAELI_DISTRICTS:
+        if _norm_for_place(d) in blob:
+            return True
+    return False
+
+
+def _kocaeli_anchor_in_title(title: str) -> bool:
+    """Local story: headline names Kocaeli or an ilçe (not boilerplate in body)."""
+    nt = _fold_tr(title)
+    if re.search(r"(?<![a-z0-9])kocaeli(?![a-z0-9])", nt):
+        return True
+    for d in KOCAELI_DISTRICTS:
+        dl = _fold_tr(d)
+        if re.search(rf"(?<![a-z0-9]){re.escape(dl)}(?:['']?[td][ae])?(?![a-z0-9])", nt):
+            return True
+    return False
+
+
+def _mentions_other_turkey_place(title: str, text: str) -> bool:
+    """
+    Another province/city named in title + lead. If headline is not Kocaeli-anchored, reject for map.
+    Scans body lead so 'Balıkesir' in first paragraphs is caught when title is vague.
+    """
+    lead = _fold_tr(title + " " + (text or "")[:1200])
+    anchored = _kocaeli_anchor_in_title(title)
+    for place in OTHER_TURKEY_PLACES:
+        if re.search(
+            rf"(?<![a-z0-9]){re.escape(place)}(?:['']?[td][ae])?(?![a-z0-9])",
+            lead,
+        ):
+            if not anchored:
+                return True
+    return False
+
+
 def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
     """
     Mandatory PDF Requirement (Section 6):
@@ -64,7 +145,10 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
     """
     if not text and not title:
         return None
-        
+
+    if _mentions_other_turkey_place(title, text):
+        return None
+
     # Only search the title and top of text to avoid footer pollution (like newspaper address)
     search_text = title + " " + text[:500]
     text_clean = search_text.replace('İ', 'i').replace('I', 'ı').lower()
@@ -92,20 +176,41 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
         if specific_loc is not None:
             break
 
-    # 2. Use Stanza NER to find LOC entities (AI-based extraction)
-    nlp = get_stanza_nlp()
-    if nlp:
-        try:
-            doc = nlp(search_text)
-            for ent in doc.ents:
-                if ent.type == "LOC":
-                    loc_name = ent.text
-                    # Avoid very short or junk entities
-                    if len(loc_name) > 2 and not any(junk in loc_name.lower() for junk in ["haber", "sayfa", "site"]):
-                        if loc_name not in candidates:
-                            candidates.append(loc_name)
-        except Exception as e:
-            print(f"Stanza NER extraction failed: {e}")
+    # 1b Hospital / clinic names (NER often misses "Devlet Hastanesi")
+    if specific_loc is None:
+        hm = re.search(
+            r"\b((?:\w+\s+){0,2}?(?:Devlet|Şehir|Özel)\s+Hastanesi)(?:'[ns]?(?:de|da|nde|nda))?\b",
+            search_text,
+            re.I,
+        )
+        if not hm:
+            hm = re.search(
+                r"\b([A-ZÇĞİÖŞÜa-zçğıöşü]{2,25}\s+Hastanesi)(?:'[ns]?(?:de|da|nde|nda))?\b",
+                search_text,
+                re.I,
+            )
+        if hm:
+            hosp = hm.group(1).strip()
+            if not any(j in hosp.lower() for j in ("haber", "gündem", "son dakika")):
+                specific_loc = hosp
+                candidates.append(hosp)
+
+    # 2. NER only when we still need hints (never used alone for map pin anymore)
+    if specific_loc is None:
+        nlp = get_stanza_nlp()
+        if nlp:
+            try:
+                doc = nlp(search_text)
+                for ent in doc.ents:
+                    if ent.type == "LOC":
+                        loc_name = ent.text
+                        if len(loc_name) > 2 and not any(
+                            junk in loc_name.lower() for junk in ["haber", "sayfa", "site"]
+                        ):
+                            if loc_name not in candidates:
+                                candidates.append(loc_name)
+            except Exception as e:
+                print(f"Stanza NER extraction failed: {e}")
 
     # 3. Detect District as a fallback or secondary anchor (Keep for strict Kocaeli validation)
     districts_found = []
@@ -113,19 +218,21 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
     
     # Suffixes: -da, -de, -dan, -den, -ya, -ye, -a, -e, -nın, -nin, -daki, -deki, -ndaki, -ndeki
     district_suffixes = r'(?:[\'’]?(?:da|de|ta|te|dan|den|tan|ten|ya|ye|a|e|ı|i|u|ü|nın|nin|nun|nün|nda|nde|ndan|nden|na|ne|lı|li|lu|lü|ki|daki|deki|taki|teki|ndaki|ndeki))?\b'
-    
+
     title_clean = title.replace('İ', 'i').replace('I', 'ı').lower()
-    
+    district_in_title = False
+
     for district in KOCAELI_DISTRICTS:
         d_lower = district.replace('İ', 'i').replace('I', 'ı').lower()
         pattern = r'\b' + re.escape(d_lower) + district_suffixes
         
         # Check if it's in the title first - TITLES get ultimate priority
         if re.search(pattern, title_clean, re.I):
-            districts_found.insert(0, district) # Put at the front
+            district_in_title = True
+            districts_found.insert(0, district)  # Put at the front
             if district not in candidates:
                 candidates.append(district)
-            district_positions.append((0, district)) # Weight 0 = Title
+            district_positions.append((0, district))  # Weight 0 = Title
             continue
             
         # Otherwise search in body
@@ -154,44 +261,24 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
             "candidates": sorted(set(candidates)),
         }
     
-    # If no specific_loc but we have NER LOC candidates
-    # We filter them to ensure they are likely in Kocaeli by checking if a district is also present
+    # District-only: require ilçe in the headline — body-only is too weak (wire copy, wrong pins).
     if district_positions:
-        # Sort by position (Title=0, then earliest in text)
         district_positions.sort(key=lambda x: x[0])
+        if not district_in_title:
+            return None
         ordered_districts = [d for pos, d in district_positions]
-        
         if len(ordered_districts) > 1 and ordered_districts[0] == "İzmit":
             district = ordered_districts[1]
         else:
             district = ordered_districts[0]
-
-        # Check if any NER candidate looks like it belongs to this district
-        # Otherwise just use the district
+        # Do not prepend Stanza LOC (e.g. "Dere") — causes false merges with ilçe names.
         best_loc = f"{district}, Kocaeli, Turkey"
-        
-        # If the earliest LOC from Stanza isn't the district itself, use it as a specific location
-        # but only if it's not a known district (to avoid redundancy like "Gebze, Gebze")
-        for cand in candidates:
-            if cand not in KOCAELI_DISTRICTS and cand not in districts_found:
-                # High probability this is a Mahalle or specific place in the district
-                best_loc = f"{cand}, {district}, Kocaeli, Turkey"
-                break
-
         return {
             "best_location_text": best_loc,
             "district": district,
             "candidates": sorted(set(candidates)),
         }
-        
-    # Final fallback: If NER found something but no district was matched, still try it with Kocaeli anchor
-    if candidates:
-        return {
-            "best_location_text": f"{candidates[0]}, Kocaeli, Turkey",
-            "district": None,
-            "candidates": sorted(set(candidates)),
-        }
-        
+
     return None
 
 
