@@ -1,0 +1,3913 @@
+===== FILE: requirements.txt =====
+
+fastapi
+uvicorn[standard]
+motor
+seleniumbase
+requests
+beautifulsoup4
+lxml
+python-dotenv
+googlemaps
+sentence-transformers
+transformers
+torch
+stanza
+pytz
+
+
+========================================================================
+
+===== FILE: run_app.bat =====
+
+@echo off
+cd /d "%~dp0"
+
+echo ==========================================
+echo   Kocaeli News Map - Startup Script
+echo ==========================================
+echo.
+echo [1/2] Activating Virtual Environment...
+call D:\Installed\venvs\kocaeli-news\Scripts\activate
+
+echo [2/2] Starting Uvicorn Server on http://127.0.0.1:8000/app/
+echo.
+echo (Keep this window open to keep the site alive)
+echo (Press Ctrl+C to stop the server)
+echo.
+
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+
+pause
+
+
+========================================================================
+
+===== FILE: run_scraper.bat =====
+
+@echo off
+cd /d "%~dp0"
+
+echo ==========================================
+echo   Kocaeli News - Scraper pipeline
+echo ==========================================
+echo.
+echo Activating virtual environment...
+call D:\Installed\venvs\kocaeli-news\Scripts\activate
+
+echo Running scraper (last 3 calendar days by default)...
+echo.
+
+cd backend
+python scraper_runner.py
+
+pause
+
+
+========================================================================
+
+===== FILE: backend/main.py =====
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from motor.motor_asyncio import AsyncIOMotorClient
+from typing import List, Optional
+import uvicorn
+import os
+import subprocess
+import sys
+from datetime import datetime
+from dotenv import load_dotenv
+
+from backend.db import ensure_indexes
+from backend.models.news import NewsItem
+
+# Load .env from project root so /api/config can read keys reliably.
+project_root = os.path.dirname(os.path.dirname(__file__))
+load_dotenv(os.path.join(project_root, ".env"))
+
+app = FastAPI(title="Kocaeli Local News Map API")
+
+# Setup CORS to allow the frontend to access the API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount the frontend directory to serve static HTML/CSS/JS files
+# This makes the app available at http://localhost:8000/
+frontend_path = os.path.join(project_root, "frontend")
+app.mount("/app", StaticFiles(directory=frontend_path, html=True), name="frontend")
+
+# MongoDB Connection String
+MONGO_URL = "mongodb://localhost:27017"
+client = None
+db = None
+
+@app.on_event("startup")
+async def startup_db_client():
+    global client, db
+    client = AsyncIOMotorClient(MONGO_URL)
+    db = client.kocaeli_news
+    await ensure_indexes(db)
+
+    # Optional: automatic scraping on startup (PDF: scraping must be automatic).
+    # Enable with SCRAPE_ON_STARTUP=true in environment.
+    scrape_on_startup = os.getenv("SCRAPE_ON_STARTUP", "").strip().lower() in {"1", "true", "yes", "on"}
+    if scrape_on_startup:
+        try:
+            venv_python = os.path.join(os.getcwd(), ".venv", "Scripts", "python.exe")
+            if not os.path.exists(venv_python):
+                venv_python = "python"
+            subprocess.Popen([venv_python, "backend/scraper_runner.py"])
+        except Exception as e:
+            # Don't break server startup if scraping fails to spawn.
+            print(f"SCRAPE_ON_STARTUP spawn failed: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    client.close()
+
+@app.get("/")
+async def root():
+    return {"message": "Welcome to Kocaeli Local News Map API"}
+
+
+@app.get("/api/config")
+async def get_public_config():
+    """
+    Public config for frontend bootstrap.
+    Do NOT hardcode API keys in frontend files.
+    """
+    maps_js_key = os.getenv("GOOGLE_MAPS_JS_API_KEY") or os.getenv("GOOGLE_MAPS_API_KEY")
+    return {"googleMapsJsApiKey": maps_js_key or ""}
+
+
+@app.get("/api/news", response_model=List[NewsItem])
+async def get_news(
+    category: Optional[str] = None,
+    district: Optional[str] = None,
+    source: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    """
+    Get news filtered by category/district/source/date range.
+    """
+    query: dict = {
+        "category": {"$ne": "Diğer"},
+        "latitude": {"$ne": None},
+        "longitude": {"$ne": None},
+    }
+    if category:
+        query["category"] = category
+    if district:
+        query["district"] = district
+    if source:
+        query["sources.name"] = source
+
+    # ISO strings stored; keep filtering via ISO strings (lexicographically sortable)
+    if date_from or date_to:
+        date_query: dict = {}
+        if date_from:
+            # validate parsable
+            datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+            date_query["$gte"] = date_from
+        if date_to:
+            datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+            date_query["$lte"] = date_to
+        query["publish_date"] = date_query
+        
+    news_cursor = db.news.find(query).sort("publish_date", -1)
+    news_list = []
+    
+    async for document in news_cursor:
+        # Convert ObjectId to string for JSON serialization
+        document["_id"] = str(document["_id"])
+        news_list.append(document)
+        
+    return news_list
+
+scraper_process = None
+
+@app.post("/api/scrape")
+async def trigger_scraper(date_from: Optional[str] = None, date_to: Optional[str] = None):
+    """
+    Triggers the scraping pipeline in the background.
+    """
+    global scraper_process
+    try:
+        # If already running, don't start another
+        if scraper_process and scraper_process.poll() is None:
+            return {"status": "already_running", "message": "Scraping is already in progress."}
+
+        # Same interpreter as this API process (works with .venv, external venv, or global).
+        # Avoid hard-coding .venv: if it was removed, "python" fallback often lacks deps.
+        scraper_script = os.path.join(project_root, "backend", "scraper_runner.py")
+        args = [sys.executable, scraper_script]
+        if date_from:
+            args += ["--date-from", date_from]
+        if date_to:
+            args += ["--date-to", date_to]
+
+        scraper_process = subprocess.Popen(args, cwd=project_root)
+        return {"status": "success", "message": "Scraping started in the background..."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/scrape/status")
+async def get_scrape_status():
+    """
+    Returns the current status of the background scraper.
+    """
+    global scraper_process
+    if scraper_process is None:
+        return {"status": "idle"}
+    
+    poll = scraper_process.poll()
+    if poll is None:
+        return {"status": "running"}
+    else:
+        return {"status": "finished", "exit_code": poll}
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+========================================================================
+
+===== FILE: backend/scraper_runner.py =====
+
+import argparse
+import asyncio
+from datetime import datetime, timedelta, timezone
+
+from motor.motor_asyncio import AsyncIOMotorClient
+from services.scraper import scrape_all_sources, default_last_three_calendar_days_iso
+from services.nlp import classify_news, is_duplicate
+from services.geocoding import extract_location_info, get_coordinates
+
+MONGO_URL = "mongodb://localhost:27017"
+client = AsyncIOMotorClient(MONGO_URL)
+db = client.kocaeli_news
+news_collection = db.news
+
+async def run_pipeline(date_from: str | None = None, date_to: str | None = None):
+    print("🚀 Starting the unified Scraper -> NLP -> Map Pipeline...")
+    
+    # 1. Scrape all raw news from 5 sites (today + yesterday + day before, Istanbul calendar)
+    print("⏳ Fetching listing pages and article HTML...")
+    if not date_from and not date_to:
+        date_from, date_to = default_last_three_calendar_days_iso()
+    window_start = datetime.fromisoformat(date_from.replace("Z", "+00:00")).astimezone(timezone.utc)
+    window_end = datetime.fromisoformat(date_to.replace("Z", "+00:00")).astimezone(timezone.utc)
+    raw_news_list = await scrape_all_sources(date_from=date_from, date_to=date_to)
+    print(f"✅ Found {len(raw_news_list)} recent news items in total.")
+    
+    # Fetch recent existing records for semantic duplicate checking.
+    # Keep it bounded for speed; requirement is semantic dedup, not exhaustive history scan.
+    now = datetime.now(timezone.utc)
+    three_days_ago = (now - timedelta(days=3)).isoformat()
+    existing_records = await news_collection.find(
+        {"publish_date": {"$gte": three_days_ago}},
+        {"content": 1, "category": 1},
+    ).sort("publish_date", -1).limit(400).to_list(length=None)
+
+    existing_records_by_category: dict[str, list[dict]] = {}
+    for rec in existing_records:
+        cat = rec.get("category") or "Diğer"
+        existing_records_by_category.setdefault(cat, []).append(rec)
+    
+    saved_count = 0
+    
+    for item in raw_news_list:
+        content = item['content']
+        title = item['title']
+        source_name = item['source']
+        url = item['url']
+
+        pub = datetime.fromisoformat(item["publish_date"].replace("Z", "+00:00"))
+        if pub.tzinfo is None:
+            pub = pub.replace(tzinfo=timezone.utc)
+        else:
+            pub = pub.astimezone(timezone.utc)
+        if not (window_start <= pub <= window_end):
+            continue
+        
+        # 2. Prevent Exact Duplicates (Check if this URL is already in any source list)
+        exists = await news_collection.find_one({"sources.url": url})
+        if exists:
+            # We already have this exact article from this source
+            continue
+            
+        # 2. Classify first (fast) to avoid expensive semantic dedup for irrelevant items.
+        category = classify_news(content, title=title)
+        if category == "Diğer":
+            continue
+
+        # 3. Prevent Semantic Duplicates (%90 Similarity)
+        # Compare only within same category to keep it fast.
+        compare_items = existing_records_by_category.get(category, [])
+        print(f"🧠 Checking '{title[:60]}...' for semantic duplicates ({category})...")
+        duplicate, score, matched_id = is_duplicate(content, compare_items)
+
+        if duplicate and matched_id is not None:
+            print(f"   🔗 Duplicate found ({score*100:.1f}%), adding {source_name} to sources list.")
+            await news_collection.update_one(
+                {"_id": matched_id},
+                {"$addToSet": {"sources": {"name": source_name, "url": url}}},
+            )
+            continue
+        
+        # Prepare item for insertion with sources list
+        db_item = {
+            "title": title,
+            "content": content,
+            "category": category,
+            "publish_date": item["publish_date"],
+            "sources": [{"name": source_name, "url": url}]
+        }
+        
+        # 4. Extract Location (structured) and Geocode
+        loc_info = extract_location_info(title, content)
+        if not loc_info:
+            print(f"   [skip] No map-safe location: {title[:55]}...")
+            continue
+        location_text = loc_info["best_location_text"]
+        lat, lng = await get_coordinates(db, location_text)
+        db_item["location_text"] = location_text
+        db_item["district"] = loc_info.get("district")
+        db_item["location_candidates"] = loc_info.get("candidates", [])
+        db_item["latitude"] = lat
+        db_item["longitude"] = lng
+
+        if db_item.get('latitude') is None:
+            print(f"   [!] Geocoding failed for article. Skipping.")
+            continue
+            
+        # 5. Save to MongoDB
+        inserted = await news_collection.insert_one(db_item)
+        existing_records_by_category.setdefault(category, []).append(
+            {"_id": inserted.inserted_id, "content": content}
+        )
+        saved_count += 1
+        print(f"   ✅ Saved: [{category}] {title}")
+        
+    print(f"🎉 Pipeline finished successfully. {saved_count} fresh news items added to Database.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date-from", dest="date_from", default=None, help="ISO datetime start (inclusive)")
+    parser.add_argument("--date-to", dest="date_to", default=None, help="ISO datetime end (inclusive)")
+    args = parser.parse_args()
+
+    # Validate ISO if provided (accept Z)
+    if args.date_from:
+        datetime.fromisoformat(args.date_from.replace("Z", "+00:00"))
+    if args.date_to:
+        datetime.fromisoformat(args.date_to.replace("Z", "+00:00"))
+
+    asyncio.run(run_pipeline(date_from=args.date_from, date_to=args.date_to))
+
+
+========================================================================
+
+===== FILE: backend/db.py =====
+
+from __future__ import annotations
+
+from motor.motor_asyncio import AsyncIOMotorDatabase
+
+
+async def ensure_indexes(db: AsyncIOMotorDatabase) -> None:
+    news = db.news
+    geocache = db.geocache
+
+    # News indexes (filters + duplicate prevention helpers)
+    await news.create_index("publish_date")
+    await news.create_index([("category", 1), ("district", 1), ("publish_date", -1)])
+    await news.create_index("sources.url")
+    await news.create_index("district")
+
+    # Geocoding cache (durable, avoids repeated API calls)
+    await geocache.create_index("key", unique=True)
+
+
+========================================================================
+
+===== FILE: backend/test_db.py =====
+
+import asyncio
+from motor.motor_asyncio import AsyncIOMotorClient
+
+async def ping_server():
+    try:
+        # Connect to local MongoDB
+        client = AsyncIOMotorClient("mongodb://localhost:27017")
+        
+        # Ping the server to check connection
+        response = await client.admin.command('ping')
+        
+        if response.get('ok') == 1.0:
+            print("✅ Successfully connected to MongoDB locally!")
+        else:
+            print("❌ Connected to MongoDB, but received unexpected response:", response)
+            
+    except Exception as e:
+        print("❌ Could not connect to MongoDB. Is the MongoDB service running?")
+        print(f"Error details: {e}")
+    finally:
+        client.close()
+
+if __name__ == "__main__":
+    asyncio.run(ping_server())
+
+
+========================================================================
+
+===== FILE: backend/models/news.py =====
+
+from pydantic import BaseModel, Field
+from typing import List, Optional, Literal
+
+Category = Literal[
+    "Trafik Kazası",
+    "Yangın",
+    "Elektrik Kesintisi",
+    "Hırsızlık",
+    "Kültürel Etkinlikler",
+    "Gündem",
+    "Diğer",
+]
+
+
+class SourceItem(BaseModel):
+    name: str
+    url: str
+
+
+class NewsItem(BaseModel):
+    # Mongo id (stringified) for API responses
+    id: Optional[str] = Field(default=None, alias="_id")
+
+    # Mandatory fields from PDF
+    category: Category
+    title: str
+    content: str
+    publish_date: str
+    sources: List[SourceItem]
+
+    # Location extraction + geocoding
+    location_text: str
+    district: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+
+    # Demo/debug visibility for extracted mentions (PDF §6)
+    location_candidates: List[str] = Field(default_factory=list)
+
+    class Config:
+        populate_by_name = True
+
+
+========================================================================
+
+===== FILE: backend/routers/news.py =====
+
+from fastapi import APIRouter
+from typing import List
+
+router = APIRouter()
+
+@router.get("/api/news")
+async def get_news():
+    return []
+
+
+========================================================================
+
+===== FILE: backend/services/cf_bypass.py =====
+
+"""
+One-shot Cloudflare clearance via SeleniumBase UC, then reuse with requests.
+"""
+from __future__ import annotations
+
+import time
+from urllib.parse import urlparse
+
+from seleniumbase import Driver
+
+# Reuse cookies across HTTP requests in this process
+cookie_cache: dict[str, str] = {}
+global_ua = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
+)
+
+
+def harvest_cloudflare_cookies(domains: list[str]) -> bool:
+    """
+    Headed Chrome (UC mode), visit each origin, pass Turnstile if shown,
+    store cf_clearance (and __cf_bm when present) for requests reuse.
+    """
+    global global_ua
+    print("\n--- [Cloudflare Bypass] Spinning up SeleniumBase harvester ---")
+    driver = None
+    try:
+        driver = Driver(uc=True, headless=False)
+    except Exception as e:
+        print(f"Failed to start SeleniumBase driver: {e}")
+        return False
+
+    harvested_count = 0
+    try:
+        for domain in domains:
+            print(f"Harvesting clearance for {domain}...")
+            driver.uc_open_with_reconnect(domain, 4)
+            try:
+                driver.uc_gui_click_captcha()
+                print(" Clicked Turnstile widget.")
+            except Exception:
+                pass
+            time.sleep(5)
+
+            parts: list[str] = []
+            for cookie in driver.get_cookies():
+                name = cookie.get("name") or ""
+                if name in ("cf_clearance", "__cf_bm") and cookie.get("value"):
+                    parts.append(f"{name}={cookie['value']}")
+
+            if parts:
+                domain_key = urlparse(domain).netloc.replace("www.", "")
+                cookie_cache[domain_key] = "; ".join(parts)
+                print(f" Successfully harvested cookies for {domain_key}")
+                harvested_count += 1
+            else:
+                print(
+                    f" No cf_clearance/__cf_bm for {domain}. "
+                    "IP block, slow load, or no Cloudflare on this URL."
+                )
+
+        global_ua = driver.execute_script("return navigator.userAgent;") or global_ua
+    except Exception as e:
+        print(f"Error during harvesting: {e}")
+    finally:
+        if driver:
+            driver.quit()
+
+    print(f"--- [Cloudflare Bypass] Harvested {harvested_count}/{len(domains)} origins ---\n")
+    return harvested_count > 0
+
+
+def get_bypass_headers(url: str) -> dict[str, str]:
+    """Headers matching the UC browser; attach harvested Cloudflare cookies if any."""
+    headers = {
+        "User-Agent": global_ua,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    domain_key = urlparse(url).netloc.replace("www.", "")
+    if domain_key in cookie_cache:
+        headers["Cookie"] = cookie_cache[domain_key]
+    return headers
+
+
+def is_cookie_valid(domain_url: str) -> bool:
+    domain_key = urlparse(domain_url).netloc.replace("www.", "")
+    return domain_key in cookie_cache
+
+
+========================================================================
+
+===== FILE: backend/services/scraper.py =====
+
+"""
+scraper.py — Listing discovery + parallel article fetch using requests.
+
+Cloudflare: harvest cf_clearance (and __cf_bm) once per origin via SeleniumBase UC,
+then reuse on all HTTP requests for that host.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, time
+from urllib.parse import urlparse, urljoin
+
+import pytz
+import requests as _requests
+from bs4 import BeautifulSoup
+
+from services.cf_bypass import get_bypass_headers, harvest_cloudflare_cookies
+
+# Fix Unicode printing issues on CMD
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
+def default_last_three_calendar_days_iso() -> tuple[str, str]:
+    """
+    Inclusive window: today, yesterday, and the day before (Europe/Istanbul calendar).
+    Returned as UTC ISO strings for the API / DB pipeline.
+    """
+    tz = pytz.timezone("Europe/Istanbul")
+    today = datetime.now(tz).date()
+    start_local = tz.localize(datetime.combine(today - timedelta(days=2), time.min))
+    end_local = tz.localize(datetime.combine(today, time(23, 59, 59, 999999)))
+    start_utc = start_local.astimezone(pytz.UTC)
+    end_utc = end_local.astimezone(pytz.UTC)
+    return (
+        start_utc.isoformat().replace("+00:00", "Z"),
+        end_utc.isoformat().replace("+00:00", "Z"),
+    )
+
+
+def _request_headers(url: str, referer: str | None = None) -> dict[str, str]:
+    h = get_bypass_headers(url)
+    netloc = urlparse(url).netloc
+    scheme = urlparse(url).scheme or "https"
+    h["Referer"] = referer or f"{scheme}://{netloc}/"
+    return h
+
+
+def _is_yenikocaeli(url: str) -> bool:
+    return "yenikocaeli.com" in urlparse(url).netloc.lower()
+
+
+def _http_get(url: str, *, referer: str | None = None) -> _requests.Response:
+    """
+    Yeni Kocaeli is often down or very slow: short timeout, no retries — fail fast.
+    Other sites use a slightly longer budget and one retry.
+    """
+    headers = _request_headers(url, referer=referer)
+    if _is_yenikocaeli(url):
+        timeout = (5, 14)  # (connect, read) seconds — bail out quickly
+        attempts = 1
+    else:
+        timeout = (12, 28)
+        attempts = 2
+
+    last_err: Exception | None = None
+    for i in range(attempts):
+        try:
+            return _requests.get(url, headers=headers, timeout=timeout)
+        except (_requests.exceptions.Timeout, _requests.exceptions.ConnectionError) as e:
+            last_err = e
+            if i + 1 < attempts:
+                time.sleep(1.5 * (i + 1))
+    assert last_err is not None
+    raise last_err
+
+
+# Archive listings use /2, /3, … after the first page; cap to avoid runaway requests.
+ARCHIVE_LISTING_MAX_PAGES = 15
+
+
+def _merge_listing_links(
+    soup: BeautifulSoup,
+    base_url: str,
+    base_host: str,
+    art_pat: re.Pattern[str],
+    links: list[str],
+    link_set: set[str],
+) -> int:
+    """Append new article URLs from one listing page; return how many were new."""
+    added = 0
+    for a in soup.find_all("a", href=True):
+        href = str(a["href"]).strip()
+        full = urljoin(base_url + "/", href).split("#")[0].split("?")[0].rstrip("/")
+        full_host = urlparse(full).netloc.replace("www.", "")
+        if full_host == base_host and art_pat.search(full) and full not in link_set:
+            link_set.add(full)
+            links.append(full)
+            added += 1
+    return added
+
+
+SITE_CONFIGS = [
+    {
+        "source": "Çağdaş Kocaeli",
+        "base_url": "https://www.cagdaskocaeli.com.tr",
+        "archive_pagination": True,
+        "listing_urls": [
+            "https://www.cagdaskocaeli.com.tr/arsiv/kocaeli-gundem-haberleri",
+            "https://www.cagdaskocaeli.com.tr/arsiv/kocaeli-asayis-haberleri",
+            "https://www.cagdaskocaeli.com.tr/arsiv/yasam",
+            "https://www.cagdaskocaeli.com.tr/arsiv/kultur-sanat",
+            "https://www.cagdaskocaeli.com.tr/arsiv/guncel",
+        ],
+        "article_pat": re.compile(r"/(haber|foto)/\d+", re.I),
+    },
+    {
+        "source": "Özgür Kocaeli",
+        "base_url": "https://www.ozgurkocaeli.com.tr",
+        "archive_pagination": True,
+        "listing_urls": [
+            "https://www.ozgurkocaeli.com.tr/arsiv/kocaeli-haberleri",
+            "https://www.ozgurkocaeli.com.tr/arsiv/kocaeli-asayis-haberleri",
+            "https://www.ozgurkocaeli.com.tr/arsiv/guncel",
+            "https://www.ozgurkocaeli.com.tr/arsiv/son-dakika",
+            "https://www.ozgurkocaeli.com.tr/arsiv/kocaeli-yasam-haberleri",
+        ],
+        "article_pat": re.compile(r"/haber/\d+", re.I),
+    },
+    {
+        "source": "Ses Kocaeli",
+        "base_url": "https://www.seskocaeli.com",
+        "archive_pagination": True,
+        "listing_urls": [
+            "https://www.seskocaeli.com/arsiv/kocaeli-son-dakika-haberler",
+            "https://www.seskocaeli.com/arsiv/kocaeli-asayis-haberleri",
+            "https://www.seskocaeli.com/arsiv/kocaeli-yasam-haberleri",
+        ],
+        "article_pat": re.compile(r"/haber/\d+", re.I),
+    },
+    {
+        "source": "Bizim Yaka",
+        "base_url": "https://www.bizimyaka.com",
+        "archive_pagination": True,
+        "listing_urls": [
+            "https://www.bizimyaka.com/arsiv/kocaeli-son-dakika-haberleri",
+            "https://www.bizimyaka.com/arsiv/kocaeli-asayis-haberleri",
+            "https://www.bizimyaka.com/arsiv/yasam-haberleri",
+        ],
+        "article_pat": re.compile(r"/haber/\d+", re.I),
+    },
+]
+
+_TR_MONTHS = {
+    "ocak": 1,
+    "şubat": 2,
+    "mart": 3,
+    "nisan": 4,
+    "mayıs": 5,
+    "haziran": 6,
+    "temmuz": 7,
+    "ağustos": 8,
+    "eylül": 9,
+    "ekim": 10,
+    "kasım": 11,
+    "aralık": 12,
+}
+
+_EN_MONTHS = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+
+def _localize_istanbul(dt: datetime) -> datetime:
+    if dt.tzinfo is not None:
+        return dt.astimezone(pytz.utc)
+    return pytz.timezone("Europe/Istanbul").localize(dt).astimezone(pytz.utc)
+
+
+def _parse_date(raw: str | None) -> datetime | None:
+    """Parse human / meta date strings to UTC. Never use scrape time as substitute."""
+    if not raw:
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+
+    # ISO-8601 only when it actually looks like ISO (avoid fromisoformat on random text)
+    if re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        try:
+            iso = s.strip().replace("Z", "+00:00")
+            main, sep, tz = iso.partition("+")
+            main = main.strip()
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", main):
+                iso = main + "T00:00:00" + ("+" + tz if sep else "")
+            elif re.match(r"^\d{4}-\d{2}-\d{2} \d", main) and "T" not in main[:13]:
+                iso = main.replace(" ", "T", 1) + ("+" + tz if sep else "")
+            dt = datetime.fromisoformat(iso)
+            return _localize_istanbul(dt)
+        except ValueError:
+            pass
+
+    sl = s.lower()
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%d/%m/%Y %H:%M",
+        "%d.%m.%Y",
+        "%d/%m/%Y",
+    ):
+        try:
+            chunk = sl[:40]
+            dt = datetime.strptime(chunk, fmt)
+            return _localize_istanbul(dt)
+        except ValueError:
+            continue
+
+    # "25 Mart 2026 - 22:10" / "25 Mar 2026 - 22:10" / "25 mart 2026 22:10"
+    m = re.search(
+        r"(\d{1,2})\s+([a-zçğıöşü]{3,9}|[a-z]{3,9})\s+(\d{4})\s*(?:[-–]\s*)?(?:(\d{1,2})\s*:\s*(\d{2}))?",
+        sl,
+    )
+    if m:
+        try:
+            day, mon_str, year = int(m.group(1)), m.group(2), int(m.group(3))
+            hour = int(m.group(4)) if m.group(4) else 0
+            minute = int(m.group(5)) if m.group(5) else 0
+            month = _TR_MONTHS.get(mon_str) or _EN_MONTHS.get(mon_str[:3])
+            if month:
+                dt = datetime(year, month, day, hour, minute)
+                return _localize_istanbul(dt)
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def _json_ld_collect_dates(obj: object) -> list[str]:
+    found: list[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            lk = str(k).lower()
+            if lk in ("datepublished", "datecreated", "uploaddate") and isinstance(v, str):
+                found.append(v)
+            found.extend(_json_ld_collect_dates(v))
+    elif isinstance(obj, list):
+        for x in obj:
+            found.extend(_json_ld_collect_dates(x))
+    return found
+
+
+def _extract_publish_datetime(soup: BeautifulSoup, html: str) -> datetime | None:
+    """Best-effort from meta, JSON-LD, <time>, then visible date patterns near the top."""
+    _META_PRIMARY = frozenset(
+        {
+            "article:published_time",
+            "og:published_time",
+            "publish-date",
+            "publishdate",
+            "date",
+            "dc.date.issued",
+            "sailthru.date",
+            "parsely-pub-date",
+        }
+    )
+    og_updated: datetime | None = None
+    for tag in soup.find_all("meta"):
+        prop = (tag.get("property") or tag.get("name") or "").strip().lower()
+        content = tag.get("content")
+        if not content:
+            continue
+        dt = _parse_date(content)
+        if not dt:
+            continue
+        if prop in _META_PRIMARY:
+            return dt
+        if prop == "og:updated_time":
+            og_updated = dt
+
+    for script in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
+        raw = script.string or script.get_text() or ""
+        if not raw.strip():
+            continue
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        for ds in _json_ld_collect_dates(data):
+            dt = _parse_date(ds)
+            if dt:
+                return dt
+
+    for t in soup.find_all("time"):
+        dt = _parse_date(t.get("datetime"))
+        if dt:
+            return dt
+        dt = _parse_date(t.get_text(" ", strip=True))
+        if dt:
+            return dt
+
+    # Visible line like listing pages: "25 Mar 2026 - 22:10" in first 6k of body text
+    blob = soup.get_text(" ", strip=True)[:6000]
+    for rx in (
+        r"\b(\d{1,2}\s+(?:Mart|Ocak|Şubat|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık)\s+\d{4}\s*[-–]\s*\d{1,2}:\d{2})\b",
+        r"\b(\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\s*[-–]\s*\d{1,2}:\d{2})\b",
+    ):
+        m = re.search(rx, blob, re.I)
+        if m:
+            dt = _parse_date(m.group(1))
+            if dt:
+                return dt
+
+    if og_updated:
+        return og_updated
+
+    return None
+
+
+def _normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    t = text.replace("\xa0", " ")
+    t = re.sub(r"[\r\n\t]+", " ", t)
+    t = re.sub(r"[ ]{2,}", " ", t).strip()
+    return t
+
+
+def _is_noise_paragraph(p: str) -> bool:
+    pl = (p or "").lower()
+    if len(pl) < 30:
+        return True
+    ad_markers = (
+        "reklam",
+        "sponsor",
+        "sponsored",
+        "google news",
+        "bizi takip edin",
+        "abone ol",
+        "bildirimleri aç",
+        "yorum yap",
+        "etiketler:",
+        "ilgili haber",
+        "tüm hakları saklıdır",
+        "kaynak:",
+    )
+    return any(m in pl for m in ad_markers)
+
+
+def _fetch_article(url: str, source: str) -> dict | None:
+    try:
+        r = _http_get(url)
+        if r.status_code != 200:
+            return None
+        s = BeautifulSoup(r.text, "lxml")
+
+        og = s.find("meta", property="og:title")
+        title = (
+            og["content"]
+            if og and og.get("content")
+            else (s.find("h1").get_text(strip=True) if s.find("h1") else s.title.get_text(strip=True))
+        )
+        title = _normalize_text(title)
+
+        c_div = s.select_one(
+            ".news-content, .article-content, .entry-content, article, .haber-metni, .habericerik"
+        )
+        if c_div:
+            paras_raw = [p.get_text(" ", strip=True) for p in c_div.find_all("p")]
+            paras = []
+            for pr in paras_raw:
+                ptxt = _normalize_text(pr)
+                if _is_noise_paragraph(ptxt):
+                    continue
+                paras.append(ptxt)
+            content = " ".join(paras) if paras else _normalize_text(c_div.get_text(separator=" ", strip=True))
+        else:
+            fallback = []
+            for p in s.find_all("p"):
+                ptxt = _normalize_text(p.get_text(" ", strip=True))
+                if _is_noise_paragraph(ptxt):
+                    continue
+                fallback.append(ptxt)
+                if len(fallback) >= 10:
+                    break
+            content = " ".join(fallback)
+        content = _normalize_text(content)
+
+        if not title:
+            return None
+
+        pub_dt = _extract_publish_datetime(s, r.text)
+        if not pub_dt:
+            # Wrong dates break the 3-day rule and the map — drop article instead of guessing.
+            return None
+
+        return {
+            "title": title,
+            "content": content,
+            "url": url,
+            "source": source,
+            "publish_date": pub_dt.astimezone(pytz.utc).isoformat(),
+        }
+    except Exception:
+        return None
+
+
+def _scrape_sync(start_dt: datetime, end_dt: datetime) -> list[dict]:
+    results: list[dict] = []
+    seen: set[str] = set()
+
+    origins = list(dict.fromkeys(str(s["base_url"]).rstrip("/") + "/" for s in SITE_CONFIGS))
+    harvest_cloudflare_cookies(origins)
+
+    print(f"⏳ SCRAPING RANGE (UTC): {start_dt.isoformat()} … {end_dt.isoformat()}")
+
+    for site in SITE_CONFIGS:
+        source = str(site["source"])
+        base_url = str(site["base_url"]).rstrip("/")
+        art_pat = site["article_pat"]
+        listing_referer = base_url + "/"
+
+        print(f"\n🌐 [{source}] Fetching listing pages...")
+        links: list[str] = []
+        link_set: set[str] = set()
+        base_host = urlparse(base_url).netloc.replace("www.", "")
+        paginate = bool(site.get("archive_pagination", True))
+        skip_rest_of_site = False  # Yeni Kocaeli: one failed open → skip entire source
+
+        for listing_base in site["listing_urls"]:
+            if skip_rest_of_site:
+                break
+            root = str(listing_base).rstrip("/")
+            page = 1
+            while True:
+                if not paginate and page > 1:
+                    break
+                l_url = root if page == 1 else f"{root}/{page}"
+                try:
+                    r = _http_get(l_url, referer=listing_referer)
+                    if r.status_code != 200:
+                        if page == 1:
+                            print(f"   [!] HTTP {r.status_code} {l_url}")
+                            if source == "Yeni Kocaeli":
+                                print("   ⏭️  Yeni Kocaeli unreachable — skipping this source.")
+                                skip_rest_of_site = True
+                        break
+                    s = BeautifulSoup(r.text, "lxml")
+                    added = _merge_listing_links(s, base_url, base_host, art_pat, links, link_set)
+                    if added:
+                        print(f"   Listing p{page}: {l_url} -> +{added} new links")
+                    if added == 0:
+                        break
+                    if not paginate:
+                        break
+                    if page >= ARCHIVE_LISTING_MAX_PAGES:
+                        break
+                    page += 1
+                except Exception as e:
+                    if page == 1:
+                        print(f"   [!] Error on {l_url}: {e}")
+                        if source == "Yeni Kocaeli":
+                            print("   ⏭️  Yeni Kocaeli unreachable — skipping this source.")
+                            skip_rest_of_site = True
+                    break
+
+        if not links:
+            continue
+
+        workers = 6 if source == "Yeni Kocaeli" else 10
+        print(f"   ⚡ Fetching {len(links)} articles in parallel (workers={workers})...")
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_fetch_article, l, source) for l in links]
+            for f in as_completed(futures):
+                res = f.result()
+                if not res:
+                    continue
+                dt = datetime.fromisoformat(res["publish_date"].replace("Z", "+00:00"))
+                if start_dt <= dt <= end_dt:
+                    if res["url"] not in seen:
+                        seen.add(res["url"])
+                        results.append(res)
+                        try:
+                            print(f"   ✅ {res['title'][:65]}...")
+                        except Exception:
+                            pass
+
+    print(f"\n✅ Scrape finished. Items in date window: {len(results)}")
+    return results
+
+
+async def scrape_all_sources(date_from: str | None = None, date_to: str | None = None) -> list[dict]:
+    if not date_from and not date_to:
+        date_from, date_to = default_last_three_calendar_days_iso()
+    now = datetime.now(pytz.utc)
+    s_dt = datetime.fromisoformat(date_from.replace("Z", "+00:00")) if date_from else now - timedelta(days=3)
+    e_dt = datetime.fromisoformat(date_to.replace("Z", "+00:00")) if date_to else now
+    if s_dt.tzinfo is None:
+        s_dt = pytz.utc.localize(s_dt)
+    else:
+        s_dt = s_dt.astimezone(pytz.utc)
+    if e_dt.tzinfo is None:
+        e_dt = pytz.utc.localize(e_dt)
+    else:
+        e_dt = e_dt.astimezone(pytz.utc)
+    return await asyncio.to_thread(_scrape_sync, s_dt, e_dt)
+
+
+========================================================================
+
+===== FILE: backend/services/geocoding.py =====
+
+from __future__ import annotations
+
+import asyncio
+import googlemaps
+import os
+import re
+# import stanza  # Moved to lazy loading in get_stanza_nlp to prevent top-level ModuleNotFoundError
+from typing import Any, Dict, List, Optional, Tuple
+
+from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorDatabase
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Google Maps Client
+# Mandatory Requirement (Section 7): "API anahtarı güvenli biçimde saklanmalıdır."
+API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+_gmaps_client = None
+
+
+def get_gmaps_client():
+    global _gmaps_client
+    if _gmaps_client is not None:
+        return _gmaps_client
+    if not API_KEY:
+        return None
+    try:
+        _gmaps_client = googlemaps.Client(key=API_KEY)
+        return _gmaps_client
+    except Exception as e:
+        print(f"Google Maps client init failed: {e}")
+        return None
+
+# Global Stanza Pipeline (Loaded lazily to save memory/startup time)
+_stanza_nlp = None
+
+def get_stanza_nlp():
+    global _stanza_nlp
+    if _stanza_nlp is None:
+        try:
+            import stanza
+            # Only load 'tokenize' and 'ner' processors for speed
+            _stanza_nlp = stanza.Pipeline("tr", processors='tokenize,ner', download_method=None)
+        except (ImportError, Exception) as e:
+            print(f"Stanza initialization failed or module not found: {e}")
+    return _stanza_nlp
+
+def _cache_key(location_name: str) -> str:
+    return re.sub(r"\s+", " ", (location_name or "").strip().lower())
+
+# List of Kocaeli Districts to extract from text
+KOCAELI_DISTRICTS = [
+    "İzmit", "Gebze", "Gölcük", "Derince", "Darıca", 
+    "Körfez", "Kartepe", "Başiskele", "Karamürsel", 
+    "Kandıra", "Dilovası", "Çayırova"
+]
+
+# Provinces / major cities outside Kocaeli (ASCII-folded keys; see _fold_tr).
+OTHER_TURKEY_PLACES = frozenset(
+    {
+        "batman", "diyarbakir", "mardin", "sirnak", "hakkari", "van", "mus", "bingol", "elazig",
+        "tunceli", "erzincan", "agri", "kars", "ardahan", "igdir", "bitlis", "siirt", "sanliurfa",
+        "gaziantep", "kahramanmaras", "adiyaman", "osmaniye", "kilis", "hatay", "antakya",
+        "iskenderun", "malatya", "sivas", "tokat", "amasya", "sinop", "rize", "trabzon",
+        "giresun", "ordu", "samsun", "zonguldak", "bolu", "edirne", "kirklareli", "tekirdag",
+        "canakkale", "balikesir", "manisa", "aydin", "mugla", "antalya", "isparta", "burdur",
+        "denizli", "afyon", "usak", "kutahya", "bursa", "yalova", "sakarya", "duzce", "bartin",
+        "kastamonu", "corum", "yozgat", "nevsehir", "kirsehir", "kirikkale", "ankara", "konya",
+        "eskisehir", "kayseri", "nigde", "aksaray", "karaman", "mersin", "adana", "istanbul",
+        "izmir", "bodrum", "fethiye","bilecik", "artvin", "bayburt", "cankiri", "erzurum",
+        "gumushane", "karabuk",
+    }
+)
+
+
+def _fold_tr(s: str) -> str:
+    """ASCII-style fold so Balıkesir/balikesir/balıkesir all match."""
+    x = _norm_for_place(s)
+    for a, b in (
+        ("ı", "i"),
+        ("ğ", "g"),
+        ("ü", "u"),
+        ("ş", "s"),
+        ("ö", "o"),
+        ("ç", "c"),
+    ):
+        x = x.replace(a, b)
+    return x
+
+
+def _norm_for_place(s: str) -> str:
+    return (
+        s.replace("İ", "i")
+        .replace("I", "ı")
+        .lower()
+        .replace("’", "'")
+        .replace("`", "'")
+    )
+
+
+def _mentions_kocaeli_context(title: str, text: str) -> bool:
+    blob = _norm_for_place(title + " " + text[:400])
+    if "kocaeli" in blob:
+        return True
+    for d in KOCAELI_DISTRICTS:
+        if _norm_for_place(d) in blob:
+            return True
+    return False
+
+
+def _kocaeli_anchor_in_title(title: str) -> bool:
+    """Local story: headline names Kocaeli or an ilçe (not boilerplate in body)."""
+    nt = _fold_tr(title)
+    if re.search(r"(?<![a-z0-9])kocaeli(?![a-z0-9])", nt):
+        return True
+    for d in KOCAELI_DISTRICTS:
+        dl = _fold_tr(d)
+        if re.search(rf"(?<![a-z0-9]){re.escape(dl)}(?:['']?[td][ae])?(?![a-z0-9])", nt):
+            return True
+    return False
+
+
+def _mentions_other_turkey_place(title: str, text: str) -> bool:
+    """
+    Another province/city named in title + lead. If headline is not Kocaeli-anchored, reject for map.
+    Scans body lead so 'Balıkesir' in first paragraphs is caught when title is vague.
+    """
+    lead = _fold_tr(title + " " + (text or "")[:1200])
+    anchored = _kocaeli_anchor_in_title(title)
+    for place in OTHER_TURKEY_PLACES:
+        if re.search(
+            rf"(?<![a-z0-9]){re.escape(place)}(?:['']?[td][ae])?(?![a-z0-9])",
+            lead,
+        ):
+            if not anchored:
+                return True
+    return False
+
+
+def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
+    """
+    Mandatory PDF Requirement (Section 6):
+    - Extract neighborhood (Mahalle), street (Sokak/Cadde) if present.
+    - Avoid footer pollution by only parsing the top 500 characters.
+    """
+    if not text and not title:
+        return None
+
+    if _mentions_other_turkey_place(title, text):
+        return None
+
+    # Only search the title and top of text to avoid footer pollution (like newspaper address)
+    search_text = title + " " + text[:500]
+    text_clean = search_text.replace('İ', 'i').replace('I', 'ı').lower()
+    
+    # 1. Detect specific address parts first (Mahalle, Cadde, Sokak)
+    specific_patterns = [
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Mahallesi)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Caddesi)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Bulvarı)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Sokağı)',
+        r'([A-ZÇĞİÖŞÜa-zçğıöşü0-9\s]+ Mevkii)'
+    ]
+    
+    candidates: List[str] = []
+    specific_loc: Optional[str] = None
+    for pattern in specific_patterns:
+        for match in re.finditer(pattern, search_text, re.I):
+            candidate = match.group(1).strip()
+            # Junk filter
+            if any(junk in candidate.lower() for junk in ["haber", "sayfa", "site", "tıkla", "güncel", "yerel"]):
+                continue
+            candidates.append(candidate)
+            if specific_loc is None:
+                specific_loc = candidate
+        if specific_loc is not None:
+            break
+
+    # 1b Hospital / clinic names (NER often misses "Devlet Hastanesi")
+    if specific_loc is None:
+        hm = re.search(
+            r"\b((?:\w+\s+){0,2}?(?:Devlet|Şehir|Özel)\s+Hastanesi)(?:'[ns]?(?:de|da|nde|nda))?\b",
+            search_text,
+            re.I,
+        )
+        if not hm:
+            hm = re.search(
+                r"\b([A-ZÇĞİÖŞÜa-zçğıöşü]{2,25}\s+Hastanesi)(?:'[ns]?(?:de|da|nde|nda))?\b",
+                search_text,
+                re.I,
+            )
+        if hm:
+            hosp = hm.group(1).strip()
+            if not any(j in hosp.lower() for j in ("haber", "gündem", "son dakika")):
+                specific_loc = hosp
+                candidates.append(hosp)
+
+    # 2. NER only when we still need hints (never used alone for map pin anymore)
+    if specific_loc is None:
+        nlp = get_stanza_nlp()
+        if nlp:
+            try:
+                doc = nlp(search_text)
+                for ent in doc.ents:
+                    if ent.type == "LOC":
+                        loc_name = ent.text
+                        if len(loc_name) > 2 and not any(
+                            junk in loc_name.lower() for junk in ["haber", "sayfa", "site"]
+                        ):
+                            if loc_name not in candidates:
+                                candidates.append(loc_name)
+            except Exception as e:
+                print(f"Stanza NER extraction failed: {e}")
+
+    # 3. Detect District as a fallback or secondary anchor (Keep for strict Kocaeli validation)
+    districts_found = []
+    district_positions = []
+    
+    # Suffixes: -da, -de, -dan, -den, -ya, -ye, -a, -e, -nın, -nin, -daki, -deki, -ndaki, -ndeki
+    district_suffixes = r'(?:[\'’]?(?:da|de|ta|te|dan|den|tan|ten|ya|ye|a|e|ı|i|u|ü|nın|nin|nun|nün|nda|nde|ndan|nden|na|ne|lı|li|lu|lü|ki|daki|deki|taki|teki|ndaki|ndeki))?\b'
+
+    title_clean = title.replace('İ', 'i').replace('I', 'ı').lower()
+    district_in_title = False
+
+    for district in KOCAELI_DISTRICTS:
+        d_lower = district.replace('İ', 'i').replace('I', 'ı').lower()
+        pattern = r'\b' + re.escape(d_lower) + district_suffixes
+        
+        # Check if it's in the title first - TITLES get ultimate priority
+        if re.search(pattern, title_clean, re.I):
+            district_in_title = True
+            districts_found.insert(0, district)  # Put at the front
+            if district not in candidates:
+                candidates.append(district)
+            district_positions.append((0, district))  # Weight 0 = Title
+            continue
+            
+        # Otherwise search in body
+        match = re.search(pattern, text_clean, re.I)
+        if match:
+            pos = match.start()
+            districts_found.append(district)
+            if district not in candidates:
+                candidates.append(district)
+            district_positions.append((pos, district))
+
+    # 4. Combine results smartly
+    district: Optional[str] = None
+
+    # If we found a specific address part (Mahalle/Sokak) via regex, it's very high confidence
+    if specific_loc:
+        if len(districts_found) == 1 and districts_found[0] != "İzmit":
+            district = districts_found[0]
+            best = f"{specific_loc}, {district}, Kocaeli, Turkey"
+        else:
+            best = f"{specific_loc}, Kocaeli, Turkey"
+
+        return {
+            "best_location_text": best,
+            "district": district,
+            "candidates": sorted(set(candidates)),
+        }
+    
+    # District-only:
+    # - If ilçe is in the headline -> high confidence.
+    # - If ilçe is only in the body, allow it only when it appears early (near the top),
+    #   to avoid false pins from generic / late mentions.
+    if district_positions:
+        district_positions.sort(key=lambda x: x[0])
+        earliest_pos = district_positions[0][0] if district_positions else 999999
+        if not district_in_title and earliest_pos > 220:
+            return None
+        ordered_districts = [d for pos, d in district_positions]
+        if len(ordered_districts) > 1 and ordered_districts[0] == "İzmit":
+            district = ordered_districts[1]
+        else:
+            district = ordered_districts[0]
+        # Do not prepend Stanza LOC (e.g. "Dere") — causes false merges with ilçe names.
+        best_loc = f"{district}, Kocaeli, Turkey"
+        return {
+            "best_location_text": best_loc,
+            "district": district,
+            "candidates": sorted(set(candidates)),
+        }
+
+    return None
+
+
+async def get_coordinates(db: AsyncIOMotorDatabase, location_name: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Calls Google Maps Geocoding API to get Latitude and Longitude.
+    STRICT VALIDATION: Rejects mapped coordinates if they fall outside Kocaeli Province.
+    """
+    if not location_name:
+        return None, None
+
+    if not API_KEY:
+        print("GOOGLE_MAPS_API_KEY is missing; cannot geocode.")
+        return None, None
+
+    gmaps = get_gmaps_client()
+    if gmaps is None:
+        print("Google Maps client is unavailable; cannot geocode.")
+        return None, None
+
+    key = _cache_key(location_name)
+    cached = await db.geocache.find_one({"key": key})
+    if cached and "lat" in cached and "lng" in cached:
+        return cached.get("lat"), cached.get("lng")
+
+    try:
+        result = await asyncio.to_thread(lambda: gmaps.geocode(location_name))
+        if result:
+            # Strict safety filter: ensure Google didn't map "Yalıkavak, Kocaeli" to "Bodrum, Muğla"
+            address = result[0].get("formatted_address", "")
+            if "Kocaeli" not in address:
+                print(f"Skipping {location_name}: Google mapped it outside Kocaeli -> {address}")
+                return None, None
+                
+            loc = result[0].get("geometry", {}).get("location", {})
+            lat, lng = loc.get("lat"), loc.get("lng")
+            if isinstance(lat, (int, float)) and isinstance(lng, (int, float)):
+                await db.geocache.update_one(
+                    {"key": key},
+                    {"$set": {"key": key, "query": location_name, "lat": lat, "lng": lng}},
+                    upsert=True,
+                )
+                return float(lat), float(lng)
+    except Exception as e:
+        print(f"Google Geocoding failed for {location_name}: {e}")
+
+    return None, None
+
+
+def extract_location_from_text(text: str) -> Optional[str]:
+    """
+    Backwards-compatible helper for older callers.
+    Returns best_location_text or None.
+    """
+    info = extract_location_info("", text)
+    if not info:
+        return None
+    return info["best_location_text"]
+
+
+========================================================================
+
+===== FILE: backend/services/nlp.py =====
+
+from __future__ import annotations
+
+from services.geocoding import _mentions_other_turkey_place
+
+# --- SentenceTransformer: duplicate detection (%90 similarity), unchanged ---
+_model = None
+_model_load_failed = False
+
+
+def get_model():
+    global _model, _model_load_failed
+    if _model is None and not _model_load_failed:
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            _model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+        except Exception as e:
+            print(f"Error loading SentenceTransformer: {e}")
+            _model_load_failed = True
+    return _model
+
+
+# --- mDeBERTa zero-shot: categorization only (lazy load) ---
+_classifier = None
+_classifier_failed = False
+TARGET_LABELS = [
+    "Trafik Kazası",
+    "Yangın",
+    "Hırsızlık",
+    "Elektrik Kesintisi",
+    "Kültürel Etkinlik",
+]
+TRAP_LABELS = [
+    "Cinayet ve Şiddet",
+    "Asayiş ve Polis Operasyonu",
+    "Mahkeme ve Adliye",
+    "Siyaset ve Belediye",
+    "Spor",
+    "Ekonomi ve İş",
+    "Eğitim",
+    "Sağlık",
+    "Magazin",
+]
+RELEVANCE_LABELS = [
+    "Kocaeli yerel olay haberi",
+    "Kocaeli dışı haber",
+    "Olay içermeyen duyuru veya genel haber",
+]
+
+
+def _contains_any(text: str, keywords: list[str]) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in keywords)
+
+
+def _category_score(label: str, text: str) -> float:
+    t = (text or "").lower()
+    evidence_weights = {
+        "Trafik Kazası": [
+            ("trafik kazası", 3.0),
+            ("zincirleme", 2.5),
+            ("çarpış", 2.0),
+            ("çarp", 1.5),
+            ("kaza", 2.8),
+            ("devril", 2.0),
+            ("takla", 2.0),
+            ("yaralı", 1.3),
+            ("sürücü", 1.0),
+            ("araç", 0.8),
+            ("trafik", 0.5),
+        ],
+        "Yangın": [
+            ("yangın", 3.0),
+            ("alev", 2.0),
+            ("itfaiye", 2.0),
+            ("küle döndü", 3.0),
+            ("duman", 1.5),
+            ("yandı", 2.2),
+            ("yanan", 1.8),
+            ("yanarak", 1.8),
+            ("alev aldı", 2.5),
+            ("yangın çıktı", 2.5),
+        ],
+        "Hırsızlık": [
+            ("hırsızlık", 3.0),
+            ("hırsız", 2.8),
+            ("soygun", 2.6),
+            ("gasp", 2.6),
+            ("yağma", 2.8),
+            ("çalındı", 2.5),
+            ("çal", 1.2),
+            ("kasadan", 1.8),
+        ],
+        "Elektrik Kesintisi": [
+            ("elektrik kesint", 3.0),
+            ("elektrikler kesildi", 3.0),
+            ("enerji kesint", 2.8),
+            ("sedaş", 2.4),
+            ("trafo", 1.6),
+            ("elektrik arıza", 2.0),
+            ("enerji verilemedi", 2.2),
+            ("elektriksiz", 3.0),
+        ],
+        "Kültürel Etkinlikler": [
+            ("festival", 2.8),
+            ("konser", 2.8),
+            ("tiyatro", 2.8),
+            ("sergi", 2.4),
+            ("şenlik", 2.2),
+            ("gösteri", 2.0),
+            ("sahne", 1.4),
+            ("etkinlik", 1.0),
+            ("kültür", 1.0),
+        ],
+    }
+    score = 0.0
+    for term, weight in evidence_weights.get(label, []):
+        if term in t:
+            score += weight
+
+    # Strong blockers as penalty
+    if _has_category_blocker(label, t):
+        score -= 2.5
+
+    # Event trigger requirement for critical categories
+    triggers = {
+        "Trafik Kazası": ["çarp", "çarpış", "devril", "takla", "kaza yaptı", "kaza"],
+        "Yangın": ["yandı", "alev aldı", "yangın çıktı", "itfaiye müdahale", "alev"],
+        "Hırsızlık": ["çalındı", "soygun", "gasp", "hırsızlık", "yağma"],
+    }
+    if label in triggers and not _contains_any(t, triggers[label]):
+        score *= 0.5
+
+    return score
+
+
+def _has_category_blocker(label: str, text: str) -> bool:
+    t = (text or "").lower()
+    blockers = {
+        "Yangın": [
+            "ruhsat denetim", "bahar temizliği", "yabani ot",
+            "ot biç", "ilaçlama", "denetimleri sürüyor",
+            "yangın tatbikatı", "yangın eğitimi", "önlem",
+            "yangın riski", "yangın uyarısı", "yangın önleme",
+        ],
+
+        "Elektrik Kesintisi": [
+            "su kesintisi", "sular ne zaman", "isu'dan", "isu ",
+            "su arızası", "su arizasi", "içme suyu", "kanalizasyon",
+            "altyapı çalışması", "boru patladı", "su hattı",
+        ],
+
+        "Trafik Kazası": [
+            "trafik denetimi", "trafik cezası", "ehliyet",
+            "radar uygulaması", "kontrol noktası", "trafik eğitimi", 
+            "trafik haftası", "ulaşım planı", "altyapı çalışması",
+        ],
+
+        "Hırsızlık": [
+            "tatbikat", "film", "dizi", "senaryo",
+        ],
+
+        "Kültürel Etkinlikler": [
+            "siyasi toplantı", "basın açıklaması",
+            "protesto", "miting",
+        ],
+    }
+    return _contains_any(t, blockers.get(label, []))
+
+
+def _normalize_target_label(label: str) -> str:
+    if label == "Kültürel Etkinlik":
+        return "Kültürel Etkinlikler"
+    return label
+
+
+def _passes_relevance_gate(classifier, text_to_check: str) -> bool:
+    try:
+        result = classifier(
+            text_to_check,
+            RELEVANCE_LABELS,
+            hypothesis_template="Bu metin {}.",
+            multi_label=False,
+        )
+        top = result["labels"][0]
+        score = float(result["scores"][0])
+        # Be less aggressive: we only want to drop clearly non-local items.
+        # Loosening prevents "important-but-unfamiliar" wording from being abstained too often.
+        if top != "Kocaeli yerel olay haberi" and score >= 0.65:
+            return False
+        return True
+    except Exception:
+        # Technical error on gate should not hard-drop all news.
+        return True
+
+
+def get_classifier():
+    global _classifier, _classifier_failed
+    if _classifier is not None or _classifier_failed:
+        return _classifier
+    try:
+        import torch
+        from transformers import pipeline
+
+        print("Loading mDeBERTa zero-shot classifier (MoritzLaurer/mDeBERTa-v3-base-mnli-xnli)...")
+        use_cuda = torch.cuda.is_available()
+        if use_cuda:
+            # HF model card: mDeBERTa has known FP16 issues; use default float32 on GPU.
+            name = torch.cuda.get_device_name(0)
+            print(f"Zero-shot classifier device: CUDA (GPU 0: {name})")
+            _classifier = pipeline(
+                "zero-shot-classification",
+                model="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
+                device=0,
+            )
+        else:
+            print(
+                "Zero-shot classifier device: CPU. "
+                "torch.cuda.is_available() is False — usually CPU-only PyTorch, "
+                "missing NVIDIA driver, or no CUDA-capable GPU. "
+                "Install CUDA-enabled torch from https://pytorch.org/get-started/locally/ if you have an NVIDIA GPU."
+            )
+            _classifier = pipeline(
+                "zero-shot-classification",
+                model="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
+                device=-1,
+            )
+    except Exception as e:
+        print(f"Zero-shot classifier load failed: {e}")
+        _classifier_failed = True
+        _classifier = None
+    return _classifier
+
+
+def classify_news(content, title=""):
+    """
+    Zero-shot labels + trap categories (court, politics, sports, …) → single best label.
+    """
+    if not content and not title:
+        return "Diğer"
+
+    if _mentions_other_turkey_place(title, (content or "")[:1200]):
+        return "Diğer"
+
+    text_to_check = f"{title}. {(content or '')[:600]}"
+    candidate_labels = TARGET_LABELS + TRAP_LABELS
+
+    hypothesis_template = "Bu haber {} hakkındadır."
+
+    classifier = get_classifier()
+    if classifier is None:
+        return "Diğer"
+
+    try:
+        if not _passes_relevance_gate(classifier, text_to_check):
+            return "Diğer"
+
+        result = classifier(
+            text_to_check,
+            candidate_labels,
+            hypothesis_template=hypothesis_template,
+            multi_label=False,
+        )
+        score_map = {lab: float(sc) for lab, sc in zip(result["labels"], result["scores"])}
+        best_target_raw = max(TARGET_LABELS, key=lambda l: score_map.get(l, 0.0))
+        best_target = _normalize_target_label(best_target_raw)
+        best_target_score = score_map.get(best_target_raw, 0.0)
+        best_trap = max(TRAP_LABELS, key=lambda l: score_map.get(l, 0.0))
+        best_trap_score = score_map.get(best_trap, 0.0)
+
+        print(
+            f"   AI target: {best_target} ({best_target_score * 100:.1f}%), "
+            f"trap: {best_trap} ({best_trap_score * 100:.1f}%)"
+        )
+
+        # Trap ratio rule: if trap is too close/high, abstain.
+        # Loosen a bit to prioritize recall over precision (user says missing is worse).
+        if best_trap_score > (best_target_score * 0.90):
+            return "Diğer"
+
+        # Fuse AI score + weighted keyword score (title is boosted).
+        fused_scores: dict[str, float] = {}
+        for raw_label in TARGET_LABELS:
+            norm_label = _normalize_target_label(raw_label)
+            ai = score_map.get(raw_label, 0.0)
+            kw_content = _category_score(norm_label, content or "")
+            kw_title = _category_score(norm_label, title or "")
+            kw_total = kw_content + (kw_title * 1.3)
+            # Normalize keyword score to [0, 1] for stable fusion.
+            kw_norm = max(0.0, min(1.0, kw_total / 10.0))
+            fused_scores[norm_label] = (ai * 0.6) + (kw_norm * 0.4)
+
+        best_fused = max(fused_scores, key=fused_scores.get)
+        best_fused_score = fused_scores[best_fused]
+
+        print(f"   FUSED: {best_fused} ({best_fused_score * 100:.1f}%)")
+
+        # Minimum acceptance threshold.
+        # Lowering slightly increases recall without adding more model calls.
+        if best_fused_score < 0.45:
+            return "Diğer"
+        if _has_category_blocker(best_fused, text_to_check):
+            return "Diğer"
+
+        return best_fused
+    except Exception as e:
+        print(f"Classification failed: {e}")
+        return "Diğer"
+
+
+def check_similarity(text1, text2):
+    """
+    Returns the similarity score between two texts using multilingual embeddings.
+    Returns a float between 0.0 and 1.0
+    """
+    try:
+        from sentence_transformers import util
+    except ImportError:
+        return 0.0
+
+    model = get_model()
+    if not model or not text1 or not text2:
+        return 0.0
+
+    embeddings1 = model.encode(text1, convert_to_tensor=True)
+    embeddings2 = model.encode(text2, convert_to_tensor=True)
+
+    cosine_scores = util.cos_sim(embeddings1, embeddings2)
+
+    return cosine_scores[0][0].item()
+
+
+def is_duplicate(new_text, existing_items, threshold=0.90):
+    """
+    Checks if a new_text is at least 90% similar to ANY existing text.
+    """
+    if not existing_items:
+        return False, 0.0, None
+
+    legacy_mode = isinstance(existing_items[0], str)
+
+    if legacy_mode:
+        max_score = 0.0
+        matched = None
+        for ext_text in existing_items:
+            if not ext_text:
+                continue
+            score = check_similarity(new_text, ext_text)
+            if score > max_score:
+                max_score = score
+                matched = ext_text
+        if max_score >= threshold:
+            return True, max_score, matched
+        return False, max_score, None
+
+    model = get_model()
+    if not model or not new_text:
+        return False, 0.0, None
+
+    try:
+        from sentence_transformers import util
+    except Exception:
+        return False, 0.0, None
+
+    ext_texts: list[str] = []
+    ext_ids: list = []
+    for item in existing_items:
+        if not item:
+            continue
+        ext_text = item.get("content") or ""
+        if not ext_text:
+            continue
+        ext_texts.append(ext_text)
+        ext_ids.append(item.get("_id"))
+
+    if not ext_texts:
+        return False, 0.0, None
+
+    new_emb = model.encode(new_text, convert_to_tensor=True)
+    existing_emb = model.encode(ext_texts, convert_to_tensor=True)
+    scores = util.cos_sim(new_emb, existing_emb)[0]
+
+    max_idx = int(scores.argmax().item())
+    max_score = float(scores[max_idx].item())
+    matched_id = ext_ids[max_idx]
+
+    if max_score >= threshold:
+        return True, max_score, matched_id
+    return False, max_score, None
+
+
+========================================================================
+
+===== FILE: frontend/index.html =====
+
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kocaeli Yerel Haberler & Harita</title>
+    
+    <!-- Leaflet removed in favor of Google Maps as per Section 8 -->
+    
+    <!-- Google Fonts (Inter) -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    
+    <!-- Custom Styles -->
+    <link rel="stylesheet" href="css/style.css">
+    
+    <!-- Font Awesome for Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"/>
+</head>
+<body>
+    <div class="app-container">
+        
+        <!-- Sidebar Navigation / Filters -->
+        <aside class="sidebar glass-panel">
+            <div class="logo">
+                <i class="fa-solid fa-map-location-dot"></i>
+                <h2>Kocaeli News Map</h2>
+            </div>
+            
+            <div class="header-actions">
+                <button id="themeToggleBtn" class="icon-btn" title="Light/Dark Mode">
+                    <i class="fa-solid fa-sun"></i>
+                </button>
+            </div>
+            
+            <p class="subtitle">Canlı Yerel Haber Akışı</p>
+            
+            <div class="filter-section">
+                <h3><i class="fa-solid fa-filter"></i> Filtrele</h3>
+                
+                <div class="form-group">
+                    <label>Haber Türü</label>
+                    <select id="categoryFilter" class="glass-input">
+                        <option value="all">Tümü Seçili</option>
+                        <option value="Trafik Kazası">Trafik Kazası</option>
+                        <option value="Yangın">Yangın</option>
+                        <option value="Elektrik Kesintisi">Elektrik Kesintisi</option>
+                        <option value="Hırsızlık">Hırsızlık</option>
+                        <option value="Kültürel Etkinlikler">Kültürel Etkinlikler</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label>İlçe</label>
+                    <select id="locationFilter" class="glass-input">
+                        <option value="all">Tüm İlçeler</option>
+                        <option value="İzmit">İzmit</option>
+                        <option value="Gebze">Gebze</option>
+                        <option value="Gölcük">Gölcük</option>
+                        <option value="Derince">Derince</option>
+                        <option value="Darıca">Darıca</option>
+                        <option value="Körfez">Körfez</option>
+                        <option value="Kartepe">Kartepe</option>
+                        <option value="Başiskele">Başiskele</option>
+                        <option value="Karamürsel">Karamürsel</option>
+                        <option value="Kandıra">Kandıra</option>
+                        <option value="Dilovası">Dilovası</option>
+                        <option value="Çayırova">Çayırova</option>
+                    </select>
+                </div>
+                
+                <div class="form-group">
+                    <label>Tarih</label>
+                    <select id="dateFilter" class="glass-input">
+                        <option value="1">Bugün (1 Gün)</option>
+                        <option value="2">Bugün ve Dün (2 Gün)</option>
+                        <option value="3" selected>Son 3 Gün</option>
+                    </select>
+                </div>
+                
+                <button id="applyFiltersBtn" class="primary-btn">Filtreleri Uygula</button>
+            </div>
+            
+            <div class="stats-section">
+                <button id="triggerScraperBtn" class="secondary-btn pulse-animation">
+                    <i class="fa-solid fa-rotate"></i> Yeni Haberleri Çek
+                </button>
+
+                <div class="stat-box mt-3">
+                    <h4 id="totalNewsStat">0</h4>
+                    <span>Haritadaki Haber</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Map Area -->
+        <main class="map-container">
+            <div id="map"></div>
+        </main>
+        
+    </div>
+
+    <!-- Custom Logic (loads Google Maps JS dynamically via /api/config) -->
+    <script src="js/app.js"></script>
+</body>
+</html>
+
+
+========================================================================
+
+===== FILE: frontend/css/style.css =====
+
+:root {
+    --bg-color: #0d1117;
+    --text-main: #c9d1d9;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --glass-bg: rgba(22, 27, 34, 0.75);
+    --glass-border: rgba(48, 54, 61, 0.8);
+    --btn-hover: #1f6feb;
+    
+    /* Category Colors */
+    --cat-trafik: #ff5e5e; /* Red for Accident */
+    --cat-yangin: #ffaa00; /* Orange for Fire */
+    --cat-elektrik: #00bcd4; /* Cyan for Power */
+    --cat-hirsizlik: #9c27b0; /* Purple for Theft */
+    --cat-kulturel: #4caf50; /* Green for Cultural */
+    --cat-gundem: #607d8b; /* Blue-gray for Gündem */
+    --cat-other: #707070; /* Gray for Other */
+}
+
+/* Light Mode Variables */
+[data-theme="light"] {
+    --bg-color: #f3f4f6;
+    --text-main: #1f2937;
+    --text-muted: #6b7280;
+    --accent: #2563eb;
+    --glass-bg: rgba(255, 255, 255, 0.85);
+    --glass-border: rgba(229, 231, 235, 0.8);
+    --btn-hover: #1d4ed8;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-family: 'Inter', sans-serif;
+    transition: background-color 0.3s, color 0.3s;
+}
+
+body {
+    background-color: var(--bg-color);
+    color: var(--text-main);
+    height: 100vh;
+    overflow: hidden;
+}
+
+.app-container {
+    display: flex;
+    height: 100vh;
+    width: 100vw;
+}
+
+/* Glassmorphism Sidebar */
+.sidebar {
+    width: 320px;
+    height: 100%;
+    background: var(--glass-bg);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border-right: 1px solid var(--glass-border);
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    z-index: 1000;
+    box-shadow: 4px 0 15px rgba(0,0,0,0.3);
+}
+
+.logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    color: var(--accent);
+    margin-bottom: 5px;
+}
+
+.logo h2 {
+    font-size: 1.3rem;
+    font-weight: 700;
+}
+
+.subtitle {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin-bottom: 30px;
+}
+
+.header-actions {
+    position: absolute;
+    top: 24px;
+    right: 24px;
+}
+
+.icon-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-size: 1.2rem;
+    cursor: pointer;
+    transition: 0.3s;
+}
+
+.icon-btn:hover {
+    color: var(--accent);
+}
+
+/* Filters */
+.filter-section {
+    flex: 1;
+    border-top: 1px solid var(--glass-border);
+    padding-top: 20px;
+}
+
+.filter-section h3 {
+    font-size: 1rem;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-main);
+}
+
+.form-group {
+    margin-bottom: 20px;
+}
+
+.form-group label {
+    display: block;
+    font-size: 0.85rem;
+    margin-bottom: 8px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.glass-input {
+    width: 100%;
+    background: rgba(13, 17, 23, 0.6);
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+    color: var(--text-main);
+    padding: 10px 12px;
+    font-size: 0.95rem;
+    outline: none;
+    transition: 0.3s;
+    appearance: none;
+    background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238b949e' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+    background-repeat: no-repeat;
+    background-position: right 10px center;
+    background-size: 1em;
+}
+
+.glass-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.2);
+}
+
+.glass-input option {
+    background: var(--bg-color);
+    color: var(--text-main);
+}
+
+.primary-btn {
+    width: 100%;
+    padding: 12px;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: 0.3s;
+    margin-top: 10px;
+}
+
+.primary-btn:hover {
+    background: var(--btn-hover);
+    transform: translateY(-2px);
+}
+
+.secondary-btn {
+    width: 100%;
+    padding: 12px;
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    font-size: 0.95rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: 0.3s;
+}
+
+.secondary-btn:hover {
+    background: rgba(88, 166, 255, 0.1);
+}
+
+.mt-3 {
+    margin-top: 15px;
+}
+
+/* Stats */
+.stats-section {
+    margin-top: auto;
+    border-top: 1px solid var(--glass-border);
+    padding-top: 20px;
+}
+
+.stat-box {
+    text-align: center;
+    background: rgba(13, 17, 23, 0.5);
+    border: 1px solid var(--glass-border);
+    border-radius: 12px;
+    padding: 15px;
+}
+
+.stat-box h4 {
+    font-size: 2rem;
+    color: var(--accent);
+    font-weight: 700;
+}
+
+.stat-box span {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+/* Map Area */
+.map-container {
+    flex: 1;
+    position: relative;
+    height: 100%;
+}
+
+#map {
+    height: 100%;
+    width: 100%;
+    background-color: var(--bg-color);
+}
+
+/* Dark theme overrides for Leaflet */
+[data-theme="dark"] .leaflet-container {
+    background: #0d1117 !important;
+}
+
+[data-theme="light"] .leaflet-container {
+    background: #f3f4f6 !important;
+}
+
+.leaflet-popup-content-wrapper {
+    background: var(--glass-bg) !important;
+    backdrop-filter: blur(10px);
+    color: var(--text-main) !important;
+    border: 1px solid var(--glass-border);
+    border-radius: 12px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+}
+
+.leaflet-popup-tip {
+    background: var(--glass-bg) !important;
+}
+
+/* Popup Custom Details */
+.popup-header {
+    border-bottom: 1px solid var(--glass-border);
+    padding-bottom: 8px;
+    margin-bottom: 10px;
+}
+
+.popup-category {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    font-weight: 700;
+    padding: 3px 6px;
+    border-radius: 4px;
+    margin-bottom: 6px;
+    display: inline-block;
+}
+
+/* Category Colors for Popup Tags */
+.cat-trafik { background: rgba(255, 94, 94, 0.2); color: var(--cat-trafik); }
+.cat-yangin { background: rgba(255, 170, 0, 0.2); color: var(--cat-yangin); }
+.cat-elektrik { background: rgba(0, 188, 212, 0.2); color: var(--cat-elektrik); }
+.cat-hirsizlik { background: rgba(156, 39, 176, 0.2); color: var(--cat-hirsizlik); }
+.cat-kulturel { background: rgba(76, 175, 80, 0.2); color: var(--cat-kulturel); }
+.cat-gundem { background: rgba(96, 125, 139, 0.2); color: var(--cat-gundem); }
+.cat-other { background: rgba(112, 112, 112, 0.2); color: var(--text-muted); }
+
+.popup-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    line-height: 1.3;
+    color: var(--text-main);
+}
+
+.popup-meta {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-bottom: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.popup-meta i {
+    width: 14px;
+    text-align: center;
+    color: var(--accent);
+}
+
+/* Marker Symbols */
+.custom-marker-wrapper {
+    position: relative;
+    width: 36px;
+    height: 36px;
+    filter: drop-shadow(0 2px 4px rgba(0,0,0,0.3));
+}
+
+.marker-symbol {
+    position: absolute;
+    top: 8px;
+    left: 18px;
+    transform: translateX(-50%);
+    color: #fff;
+    font-size: 14px;
+    pointer-events: none;
+}
+
+/* Updated Sources List & Buttons */
+.sources-list {
+    margin-top: 15px;
+    padding-top: 15px;
+    border-top: 1px solid var(--glass-border);
+}
+
+.sources-label {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    margin-bottom: 8px;
+}
+
+.source-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: rgba(13, 17, 23, 0.3);
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin-bottom: 8px;
+}
+
+.source-name {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-main);
+}
+
+.go-to-btn {
+    background: var(--accent);
+    color: #fff !important;
+    text-decoration: none;
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 6px 10px;
+    border-radius: 6px;
+    transition: 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.go-to-btn:hover {
+    background: var(--btn-hover);
+    transform: scale(1.05);
+}
+
+.popup-footer {
+    margin-top: 10px;
+    opacity: 0.8;
+}
+
+.popup-snippet {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-style: italic;
+    line-height: 1.4;
+}
+
+/* Animations */
+.pulse-animation {
+    animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(88, 166, 255, 0.4); }
+    70% { box-shadow: 0 0 0 10px rgba(88, 166, 255, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(88, 166, 255, 0); }
+}
+
+
+========================================================================
+
+===== FILE: frontend/js/app.js =====
+
+// Google Maps Global Objects
+let map;
+let allNewsData = [];
+let mapMarkers = [];
+let infoWindow;
+
+// Center of Kocaeli (İzmit)
+const KOCAELI_CENTER = { lat: 40.7654, lng: 29.9408 };
+
+// Initialize Google Map (called by Google Maps JS callback)
+function initMap() {
+    map = new google.maps.Map(document.getElementById("map"), {
+        zoom: 11,
+        center: KOCAELI_CENTER,
+        mapId: "DEMO_MAP_ID",
+        styles: [
+            { "featureType": "poi", "stylers": [{ "visibility": "off" }] }
+        ]
+    });
+
+    infoWindow = new google.maps.InfoWindow();
+
+    // Once map is ready, load the news (last 3 days already enforced by backend scraper)
+    loadNews();
+}
+
+// Required by Google Maps callback when script is loaded dynamically.
+window.initMap = initMap;
+
+async function bootstrapGoogleMaps() {
+    try {
+        const cfgRes = await fetch('/api/config');
+        const cfg = await cfgRes.json();
+        const apiKey = (cfg.googleMapsJsApiKey || "").trim();
+
+        if (!apiKey) {
+            const mapEl = document.getElementById("map");
+            if (mapEl) {
+                mapEl.innerHTML = '<div style="padding:16px;font-family:Inter,Arial,sans-serif;color:#8b949e;">Google Maps JS API anahtari eksik. Lutfen proje kokunde .env dosyasini olusturup `GOOGLE_MAPS_JS_API_KEY` (veya `GOOGLE_MAPS_API_KEY`) degerini ekleyin.</div>';
+            }
+            return;
+        }
+
+        const script = document.createElement("script");
+        script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&callback=initMap`;
+        script.defer = true;
+        script.async = true;
+        script.onerror = () => {
+            const mapEl = document.getElementById("map");
+            if (mapEl) {
+                mapEl.innerHTML = '<div style="padding:16px;font-family:Inter,Arial,sans-serif;color:#8b949e;">Google Maps yuklenemedi. API anahtari veya ag baglantisini kontrol edin.</div>';
+            }
+        };
+        document.head.appendChild(script);
+    } catch (error) {
+        console.error("Failed to bootstrap Google Maps:", error);
+        const mapEl = document.getElementById("map");
+        if (mapEl) {
+            mapEl.innerHTML = '<div style="padding:16px;font-family:Inter,Arial,sans-serif;color:#8b949e;">Harita baslatilirken bir hata olustu.</div>';
+        }
+    }
+}
+
+// Icon mapping for FontAwesome symbols
+const categoryIcons = {
+    "Trafik Kazası": "fa-car-burst",
+    "Yangın": "fa-fire",
+    "Elektrik Kesintisi": "fa-bolt",
+    "Hırsızlık": "fa-user-secret",
+    "Kültürel Etkinlikler": "fa-masks-theater"
+};
+
+const categoryColors = {
+    "Trafik Kazası": "#ff5e5e",
+    "Yangın": "#ffaa00",
+    "Elektrik Kesintisi": "#00bcd4",
+    "Hırsızlık": "#9c27b0",
+    "Kültürel Etkinlikler": "#4caf50"
+};
+
+// SVG Paths for symbols
+const categoryPaths = {
+    "Trafik Kazası": "M18.92 6.01C18.72 5.42 18.16 5 17.5 5h-11c-.66 0-1.21.42-1.42 1.01L3 12v8c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-1h12v1c0 .55.45 1 1 1h1c.55 0 1-.45 1-1v-8l-2.08-5.99zM6.5 16c-.83 0-1.5-.67-1.5-1.5S5.67 13 6.5 13s1.5.67 1.5 1.5S7.33 16 6.5 16zm11 0c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zM5 11l1.5-4.5h11L19 11H5z",
+    "Yangın": "M13.5.67s.74 2.65.74 4.8c0 2.06-1.35 3.73-3.41 3.73-2.07 0-3.63-1.67-3.63-3.73l.03-.36C5.21 7.51 4 10.62 4 14c0 4.42 3.58 8 8 8s8-3.58 8-8c0-6-4-10.74-4-10.74l-2.5-2.59zM11.89 19.74c-2.32 0-4.2-1.88-4.2-4.2 0-1.2.5-2.29 1.3-3.07.06-.06.27-.24.27-.24l1.37-1.3s1.26 1.13 1.26 3.58c0 1.05.85 1.91 1.91 1.91s1.91-.85 1.91-1.91c0-2-1-3.6-1-3.6s2.5 1.6 2.5 5.56c.01 2.32-1.87 4.27-4.19 4.27z",
+    "Elektrik Kesintisi": "M7 2v11h3v9l7-12h-4l4-8z",
+    "Hırsızlık": "M17 12c-2.76 0-5 2.24-5 5s2.24 5 5 5 5-2.24 5-5-2.24-5-5-5zm0 8c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zM12 17c0-2.76-2.24-5-5-5s-5 2.24-5 5 2.24 5 5 5 5-2.24 5-5zm-5 3c-1.66 0-3-1.34-3-3s1.34-3 3-3 3 1.34 3 3-1.34 3-3 3zm15-4v-1c0-4.42-3.58-8-8-8s-8 3.58-8 8v1c-1.1 0-2 .9-2 2v3c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2v-3c0-1.1-.9-2-2-2z",
+    "Kültürel Etkinlikler": "M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm4.5-9c.83 0 1.5-.67 1.5-1.5S17.33 8 16.5 8s-1.5.67-1.5 1.5.67 1.5 1.5 1.5zm-9 0c.83 0 1.5-.67 1.5-1.5S8.33 8 7.5 8s-1.5.67-1.5 1.5.67 1.5 1.5 1.5zm4.5 4.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z"
+};
+
+const categoryClasses = {
+    "Trafik Kazası": "cat-trafik",
+    "Yangın": "cat-yangin",
+    "Elektrik Kesintisi": "cat-elektrik",
+    "Hırsızlık": "cat-hirsizlik",
+    "Kültürel Etkinlikler": "cat-kulturel"
+};
+
+// Fetch all news once and filter on client
+async function loadNews() {
+    try {
+        const response = await fetch('/api/news');
+        allNewsData = await response.json();
+        applyFilters();
+    } catch (error) {
+        console.error("Error fetching news:", error);
+    }
+}
+
+// Render markers on the map
+function renderMarkers(filteredData) {
+    mapMarkers.forEach(marker => marker.setMap(null));
+    mapMarkers = [];
+
+    document.getElementById('totalNewsStat').innerText = filteredData.length;
+
+    filteredData.forEach(news => {
+        if (!news.latitude || !news.longitude) return;
+
+        const catColor = categoryColors[news.category] || "#707070";
+        const iconClass = categoryIcons[news.category] || "fa-circle-info";
+        const pathData = categoryPaths[news.category] || categoryPaths["Trafik Kazası"];
+
+        // Add a very slight random jitter (~100-200 meters) so markers at the exact same city block don't overlap completely
+        const jitterLat = (Math.random() - 0.5) * 0.004;
+        const jitterLng = (Math.random() - 0.5) * 0.004;
+
+        const marker = new google.maps.Marker({
+            position: { lat: news.latitude + jitterLat, lng: news.longitude + jitterLng },
+            map: map,
+            title: news.title,
+            icon: {
+                path: pathData,
+                fillColor: catColor,
+                fillOpacity: 1,
+                strokeColor: '#FFFFFF',
+                strokeWeight: 1.5,
+                scale: 1.2,
+                anchor: new google.maps.Point(12, 12)
+            }
+        });
+
+        const dateObj = new Date(news.publish_date);
+        const dateString = dateObj.toLocaleDateString('tr-TR', {
+            day: 'numeric', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit'
+        });
+
+        const catClass = categoryClasses[news.category] || "cat-trafik";
+
+        let sourcesHtml = '';
+        if (news.sources && Array.isArray(news.sources)) {
+            sourcesHtml = news.sources.map(s =>
+                `<div class="source-item">
+                    <span class="source-name">${s.name}</span>
+                    <a href="${s.url}" target="_blank" class="go-to-btn">Habere Git <i class="fa-solid fa-arrow-up-right-from-square"></i></a>
+                </div>`
+            ).join('');
+        }
+
+        const popupContent = `
+            <div class="g-popup-wrap">
+                <div class="popup-header">
+                    <span class="popup-category ${catClass}"><i class="fa-solid ${iconClass}"></i> ${news.category}</span>
+                    <div class="popup-title">${news.title}</div>
+                </div>
+                <div class="popup-meta">
+                    <div style="color:#8b949e; font-size:12px; margin-bottom:4px;"><i class="fa-solid fa-clock"></i> ${dateString}</div>
+                    <div style="color:#8b949e; font-size:12px; margin-bottom:8px;"><i class="fa-solid fa-location-crosshairs"></i> ${news.location_text}</div>
+                </div>
+                <div class="sources-list" style="margin-top:10px; border-top:1px solid #30363d; padding-top:10px;">
+                    <div class="sources-label" style="font-size:11px; font-weight:bold; color:#8b949e; margin-bottom:5px;">KAYNAKLAR:</div>
+                    ${sourcesHtml}
+                </div>
+                <div class="popup-footer" style="margin-top:10px;">
+                    <p class="popup-snippet" style="font-size:12px; font-style:italic; color:#8b949e;">${news.content.substring(0, 100)}...</p>
+                </div>
+            </div>
+        `;
+
+        marker.addListener("click", () => {
+            infoWindow.setContent(popupContent);
+            infoWindow.open(map, marker);
+        });
+
+        mapMarkers.push(marker);
+    });
+}
+
+// Client-side filters: category, district, date (last 3 days window)
+function applyFilters() {
+    const category = document.getElementById('categoryFilter').value;
+    const district = document.getElementById('locationFilter').value;
+    const dateRange = document.getElementById('dateFilter').value;
+
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    
+    let cutoffDate = null;
+    if (dateRange === '1') {
+        cutoffDate = todayStart;
+    } else if (dateRange === '2') {
+        cutoffDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+        cutoffDate.setHours(0, 0, 0, 0);
+    } else if (dateRange === '3') {
+        cutoffDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 2);
+        cutoffDate.setHours(0, 0, 0, 0);
+    }
+
+    const filteredData = allNewsData.filter(news => {
+        if (category !== 'all' && news.category !== category) return false;
+        if (district !== 'all') {
+            if (!news.location_text || !news.location_text.includes(district)) return false;
+        }
+        if (cutoffDate) {
+            const newsDate = new Date(news.publish_date);
+            if (newsDate < cutoffDate) return false;
+        }
+        return true;
+    });
+
+    renderMarkers(filteredData);
+}
+
+// Event listeners
+document.getElementById('applyFiltersBtn').addEventListener('click', () => {
+    applyFilters();
+});
+
+const themeBtn = document.getElementById('themeToggleBtn');
+themeBtn.addEventListener('click', () => {
+    const currentTheme = document.documentElement.getAttribute('data-theme');
+    const newTheme = currentTheme === 'light' ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', newTheme);
+    localStorage.setItem('theme', newTheme);
+});
+
+const triggerScraperBtn = document.getElementById('triggerScraperBtn');
+triggerScraperBtn.addEventListener('click', async () => {
+    const icon = triggerScraperBtn.querySelector('i');
+    icon.classList.add('fa-spin');
+    triggerScraperBtn.disabled = true;
+
+    try {
+        const response = await fetch('/api/scrape', { method: 'POST' });
+        const data = await response.json();
+
+        if (data.status === 'already_running') {
+            alert("Tarama zaten devam ediyor. Lütfen bekleyin.");
+            return;
+        }
+
+        // Poll for status
+        const pollInterval = setInterval(async () => {
+            try {
+                const statusRes = await fetch('/api/scrape/status');
+                const statusData = await statusRes.json();
+
+                if (statusData.status === 'finished' || statusData.status === 'idle') {
+                    clearInterval(pollInterval);
+                    icon.classList.remove('fa-spin');
+                    triggerScraperBtn.disabled = false;
+                    loadNews(); // Finally load the fresh news
+                }
+            } catch (e) {
+                console.error("Status check failed:", e);
+            }
+        }, 2000);
+
+    } catch (error) {
+        console.error("Error triggering scraper:", error);
+        icon.classList.remove('fa-spin');
+        triggerScraperBtn.disabled = false;
+    }
+});
+
+document.addEventListener('DOMContentLoaded', () => {
+    const savedTheme = localStorage.getItem('theme') || 'light';
+    document.documentElement.setAttribute('data-theme', savedTheme);
+    bootstrapGoogleMaps();
+});
+
+
+========================================================================
+
+===== FILE: _bundle_tmp.py =====
+
+﻿import os
+from pathlib import Path
+
+root = Path(r"c:\Users\PISHTAAZ SOFTWARE\Desktop\Project")
+out = root / "220201144_220201146.txt"
+
+# Ordered core paths first, then rest
+ordered = [
+    root / "requirements.txt",
+    root / "run_app.bat",
+    root / "run_scraper.bat",
+    root / "backend" / "main.py",
+    root / "backend" / "scraper_runner.py",
+    root / "backend" / "db.py",
+    root / "backend" / "test_db.py",
+    root / "backend" / "models" / "news.py",
+    root / "backend" / "routers" / "news.py",
+    root / "backend" / "services" / "cf_bypass.py",
+    root / "backend" / "services" / "scraper.py",
+    root / "backend" / "services" / "geocoding.py",
+    root / "backend" / "services" / "nlp.py",
+    root / "frontend" / "index.html",
+    root / "frontend" / "css" / "style.css",
+    root / "frontend" / "js" / "app.js",
+]
+
+seen = set(p.resolve() for p in ordered if p.exists())
+
+# All other .py under root (not in venv)
+extra_py = sorted(root.rglob("*.py"), key=lambda p: str(p).lower())
+skip_parts = {".venv", "venv", "__pycache__", ".git"}
+def ok(p):
+    parts = set(p.parts)
+    if any(s in parts for s in skip_parts):
+        return False
+    return True
+
+extra_py = [p for p in extra_py if ok(p) and p.resolve() not in seen]
+
+lines = []
+sep = "\n\n" + ("=" * 72) + "\n\n"
+
+def add_file(path: Path):
+    rel = path.relative_to(root)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        text = f"<could not read: {e}>"
+    lines.append(f"===== FILE: {rel.as_posix()} =====\n\n")
+    lines.append(text.rstrip() + "\n")
+
+for p in ordered:
+    if p.exists():
+        add_file(p)
+
+for p in extra_py:
+    add_file(p)
+
+out.write_text(sep.join(block.strip() + "\n" for block in [
+    "\n".join(lines[i:i+1]) if False else ""  # placeholder wrong
+]), encoding="utf-8")
+
+
+========================================================================
+
+===== FILE: audit_news.py =====
+
+from motor.motor_asyncio import AsyncIOMotorClient
+import asyncio
+import json
+
+async def audit_categories():
+    client = AsyncIOMotorClient("mongodb://localhost:27017")
+    db = client.kocaeli_news
+    
+    news_list = await db.news.find({}, {"title": 1, "category": 1, "location_text": 1}).to_list(length=100)
+    
+    with open("audit_final.txt", "w", encoding="utf-8") as f:
+        f.write(f"{'TITLE':<60} | {'CATEGORY':<20} | {'LOCATION'}\n")
+        f.write("-" * 110 + "\n")
+        for n in news_list:
+            f.write(f"{n['title'][:58]:<60} | {n['category']:<20} | {n.get('location_text')}\n")
+
+if __name__ == "__main__":
+    asyncio.run(audit_categories())
+
+
+========================================================================
+
+===== FILE: backend/models/__init__.py =====
+
+
+
+
+========================================================================
+
+===== FILE: backend/routers/__init__.py =====
+
+
+
+
+========================================================================
+
+===== FILE: backend/services/__init__.py =====
+
+
+
+
+========================================================================
+
+===== FILE: check_db.py =====
+
+import motor.motor_asyncio
+import asyncio
+
+async def check():
+    client = motor.motor_asyncio.AsyncIOMotorClient('mongodb://localhost:27017')
+    db = client['kocaeli_news']
+    # Get total count
+    total = await db.news.count_documents({})
+    # Get 3-day count (approximate by sorting and matching recent)
+    news = await db.news.find().sort('publish_date', -1).limit(60).to_list(60)
+    
+    sources = {}
+    for n in news:
+        s = n.get('source', 'Unknown')
+        sources[s] = sources.get(s, 0) + 1
+    
+    print(f"Total in DB: {total}")
+    print(f"Distribution of recent 60 items: {sources}")
+    if news:
+        print(f"Latest URL: {news[0].get('url', 'No URL')}")
+
+if __name__ == "__main__":
+    asyncio.run(check())
+
+
+========================================================================
+
+===== FILE: check_db_simple.py =====
+
+import motor.motor_asyncio
+import asyncio
+
+async def check():
+    client = motor.motor_asyncio.AsyncIOMotorClient('mongodb://localhost:27017')
+    db = client['kocaeli_news']
+    total = await db.news.count_documents({})
+    news = await db.news.find().sort('publish_date', -1).limit(10).to_list(10)
+    
+    print(f"Total News in DB: {total}")
+    for n in news:
+        s_list = n.get('sources', [])
+        source_name = s_list[0].get('name') if s_list else 'Unknown'
+        url = s_list[0].get('url') if s_list else 'None'
+        print(f"[{source_name}] {n.get('title')[:60]}... URL: {url}")
+
+if __name__ == "__main__":
+    asyncio.run(check())
+
+
+========================================================================
+
+===== FILE: check_rss_debug.py =====
+
+import feedparser
+import requests
+from bs4 import BeautifulSoup
+import re
+
+URL = "https://www.seskocaeli.com/rss"
+
+def check_rss():
+    print(f"Checking {URL}...")
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    resp = requests.get(URL, headers=headers, timeout=20)
+    feed = feedparser.parse(resp.content)
+    
+    print(f"Found {len(feed.entries)} entries.")
+    for entry in feed.entries:
+        title = entry.title
+        link = entry.link
+        print(f"- {title}")
+        if "Dilovası" in title or "yangın" in title.lower() or "ağıl" in title.lower():
+            print(f"  *** MATCH FOUND: {title} ***")
+            print(f"  Link: {link}")
+
+if __name__ == "__main__":
+    check_rss()
+
+
+========================================================================
+
+===== FILE: clean_db.py =====
+
+from motor.motor_asyncio import AsyncIOMotorClient
+import asyncio
+
+async def clean_db():
+    client = AsyncIOMotorClient("mongodb://localhost:27017")
+    db = client.kocaeli_news
+    await db.news.delete_many({})
+    print("Database cleared successfully.")
+
+if __name__ == "__main__":
+    asyncio.run(clean_db())
+
+
+========================================================================
+
+===== FILE: debug_nlp.py =====
+
+from backend.services.nlp import classify_news
+
+title = "Sahte Para, Uyuşturucu ve Ruhsatsız Silah Ele Geçirildi"
+content = "Kocaeli'de polis ekipleri tarafından düzenlenen operasyonda sahte para ve uyuşturucu ele geçirildi. Şüpheliler gözaltına alındı."
+
+category = classify_news(content, title=title)
+print(f"Result: {category}")
+
+
+========================================================================
+
+===== FILE: debug_pipeline.py =====
+
+import asyncio
+from backend.services.scraper import scrape_all_sources
+from backend.services.geocoding import extract_location_from_text, get_coordinates
+
+async def debug_extraction():
+    print("Fetching raw news samples...")
+    news_list = await scrape_all_sources()
+    print(f"Total found: {len(news_list)}")
+    
+    success_count = 0
+    for i, item in enumerate(news_list[:20]): # Check first 20
+        title = item['title']
+        content = item['content']
+        loc = extract_location_from_text(content)
+        
+        if loc:
+            lat, lng = get_coordinates(loc)
+            if lat:
+                print(f"[{i}] SUCCESS | {title} | Loc: {loc} | Coords: {lat}, {lng}")
+                success_count += 1
+            else:
+                print(f"[{i}] GEO-FAIL | {title} | Loc: {loc}")
+        else:
+            print(f"[{i}] LOC-FAIL | {title} | Content Snippet: {content[:100]}...")
+
+    print(f"\nSummary: {success_count}/20 succeeded.")
+
+if __name__ == "__main__":
+    asyncio.run(debug_extraction())
+
+
+========================================================================
+
+===== FILE: debug_scraper.py =====
+
+"""
+Quick diagnostic: visits ONE listing page per site in UC mode,
+counts article links found, then tests requests fetch on the first article.
+Run with: .venv\Scripts\python debug_scraper.py
+"""
+import re, time, random
+from urllib.parse import urljoin, urlparse
+import requests
+from bs4 import BeautifulSoup
+from seleniumbase import SB
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36",
+    "Accept-Language": "tr-TR,tr;q=0.9",
+}
+
+SITES = [
+    ("Çağdaş",  "https://www.cagdaskocaeli.com.tr/",  r"cagdaskocaeli\.com\.tr/[\w\-]{10,}"),
+    ("Özgür",   "https://www.ozgurkocaeli.com.tr/",    r"ozgurkocaeli\.com\.tr/[\w\-]{10,}"),
+    ("Ses",     "https://www.seskocaeli.com/",          r"seskocaeli\.com/[\w\-]{10,}"),
+    ("Yeni",    "https://www.yenikocaeli.com/",         r"yenikocaeli\.com/[\w\-]{10,}"),
+    ("Bizim",   "https://www.bizimyaka.com/",           r"bizimyaka\.com/[\w\-]{10,}"),
+]
+
+JUNK = re.compile(r"#|javascript|mailto|\.pdf|\.jpg|\.png|/wp-|/feed|/tag/|/author/|/page/|/sayfa/", re.I)
+
+with SB(uc=True, headless=False, incognito=True) as sb:
+    for name, url, pat in SITES:
+        print(f"\n{'='*60}")
+        print(f"[{name}] Opening: {url}")
+        try:
+            sb.uc_open_with_reconnect(url, reconnect_time=3)
+            time.sleep(2)
+            html = sb.get_page_source()
+            soup = BeautifulSoup(html, "lxml")
+            page_title = soup.title.get_text(strip=True) if soup.title else "???"
+            print(f"  Page title: {page_title}")
+
+            # Collect links
+            links = []
+            art_re = re.compile(pat, re.I)
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                full = urljoin(url, href)
+                if JUNK.search(full): continue
+                if not art_re.search(full): continue
+                parsed = urlparse(full)
+                clean = parsed.scheme + "://" + parsed.netloc + parsed.path.rstrip("/")
+                if clean not in links:
+                    links.append(clean)
+
+            print(f"  Article links found: {len(links)}")
+            for l in links[:5]:
+                print(f"    {l}")
+
+            if links:
+                # Export cookies
+                session = requests.Session()
+                for c in sb.driver.get_cookies():
+                    session.cookies.set(c["name"], c["value"], domain=c.get("domain",""))
+                ua = sb.driver.execute_script("return navigator.userAgent;")
+                session.headers.update({"User-Agent": ua, **HEADERS})
+
+                # Test fetch on first article
+                test_url = links[0]
+                print(f"\n  Testing requests fetch: {test_url}")
+                resp = session.get(test_url, timeout=12, allow_redirects=True)
+                print(f"  Status: {resp.status_code}")
+                if resp.status_code == 200:
+                    s2 = BeautifulSoup(resp.content, "lxml")
+                    h1 = s2.find("h1")
+                    print(f"  H1: {h1.get_text(strip=True)[:100] if h1 else 'NOT FOUND'}")
+                else:
+                    print(f"  ❌ Still blocked even with cookies!")
+        except Exception as e:
+            print(f"  ERROR: {e}")
+
+print("\nDone.")
+
+
+========================================================================
+
+===== FILE: diag_403.py =====
+
+import requests
+import sys
+
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,tr;q=0.8",
+}
+
+urls = [
+    "https://www.cagdaskocaeli.com.tr",
+    "https://www.ozgurkocaeli.com.tr",
+    "https://www.seskocaeli.com"
+]
+
+for url in urls:
+    print(f"--- {url} ---")
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        print(f"Status: {resp.status_code}")
+        if resp.status_code == 200:
+            # Print a snippet of the menu/nav if possible
+            print(resp.text[:2000])
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+========================================================================
+
+===== FILE: diag_archive.py =====
+
+import requests
+from bs4 import BeautifulSoup
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept-Language": "tr-TR,tr;q=0.9",
+}
+
+urls = [
+    "https://www.cagdaskocaeli.com.tr/arsiv/kocaeli-gundem-haberleri",
+    "https://www.ozgurkocaeli.com.tr/arsiv/kocaeli-haberleri",
+    "https://www.seskocaeli.com/arsiv/kocaeli-son-dakika-haberler"
+]
+
+for url in urls:
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        print(f"URL: {url} -> Status: {r.status_code}")
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "lxml")
+            links = [a['href'] for a in soup.find_all('a', href=True) if '/haber/' in a['href']]
+            print(f"   Found {len(links)} links containing '/haber/' in HTML.")
+            # Print first few links
+            for l in links[:3]: print(f"     {l}")
+        else:
+            print(f"   HTML snippet: {r.text[:200]}")
+    except Exception as e:
+        print(f"   Error: {e}")
+
+
+========================================================================
+
+===== FILE: diagnose_db.py =====
+
+from motor.motor_asyncio import AsyncIOMotorClient
+import asyncio
+
+async def diagnose():
+    client = AsyncIOMotorClient("mongodb://localhost:27017")
+    db = client.kocaeli_news
+    
+    # 1. Check schemas
+    total = await db.news.count_documents({})
+    with_sources = await db.news.count_documents({"sources": {"$exists": True}})
+    old_schema = await db.news.count_documents({"source": {"$exists": True}})
+    
+    print(f"Total News: {total}")
+    print(f"News with new schema (sources list): {with_sources}")
+    print(f"News with old schema (source string): {old_schema}")
+    
+    # 2. Check geocoding variety
+    pipeline = [
+        {"$match": {"latitude": {"$ne": None}}},
+        {"$group": {"_id": {"lat": "$latitude", "lng": "$longitude"}, "count": {"$sum": 1}, "locations": {"$addToSet": "$location_text"}}}
+    ]
+    coords = await db.news.aggregate(pipeline).to_list(length=None)
+    print("\nDistinct Coordinates in DB:")
+    for c in coords:
+        print(f"Coords: {c['_id']} | Count: {c['count']} | Sample Locations: {c['locations'][:3]}")
+
+if __name__ == "__main__":
+    asyncio.run(diagnose())
+
+
+========================================================================
+
+===== FILE: discover_feeds.py =====
+
+"""
+Find RSS/feed links from the news sites homepage links.
+"""
+import requests
+from bs4 import BeautifulSoup
+
+SITES = [
+    ("Ses Kocaeli", "https://www.seskocaeli.com"),
+    ("Cagdas Kocaeli", "https://www.cagdaskocaeli.com.tr"),
+    ("Ozgur Kocaeli", "https://www.ozgurkocaeli.com.tr"),
+    ("Yeni Kocaeli", "https://www.yenikocaeli.com"),
+    ("Bizim Yaka", "https://www.bizimyaka.com"),
+]
+
+h = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,*/*",
+    "Accept-Language": "tr-TR,tr;q=0.9",
+    "Referer": "https://www.google.com/search?q=kocaeli+haber",
+}
+
+for name, base in SITES:
+    print(f"\n=== {name} ({base}) ===")
+    try:
+        r = requests.get(base, headers=h, timeout=15)
+        print(f"  Homepage: {r.status_code}")
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.content, "lxml")
+            # Look for feed links in the <head>
+            rss_links = soup.find_all("link", type=lambda t: t and ("rss" in t.lower() or "atom" in t.lower()))
+            for link in rss_links:
+                print(f"  FEED FOUND: {link.get('href')} ({link.get('title','')})")
+    except Exception as e:
+        print(f"  ERROR: {e}")
+
+
+========================================================================
+
+===== FILE: extract_nav.py =====
+
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+urls = [
+    "https://www.yenikocaeli.com",
+    "https://www.bizimyaka.com",
+    "https://www.ozgurkocaeli.com.tr",
+    "https://www.cagdaskocaeli.com.tr",
+    "https://www.seskocaeli.com"
+]
+
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+}
+
+targets = ["gündem", "gundem", "asayiş", "asayis", "arayis", "yerel", "yaşam", "yasam", "son dakika", "güncel", "guncel", "polis"]
+
+for url in urls:
+    print(f"\n=== {url} ===")
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        print(f"Status: {resp.status_code}")
+        if resp.status_code != 200:
+            continue
+            
+        soup = BeautifulSoup(resp.content, "lxml")
+        # Look specifically in <nav> or <ul> or <li> for menu items
+        links_found = []
+        for a in soup.find_all("a", href=True):
+            text = a.get_text(strip=True).lower()
+            href = a["href"]
+            if any(t in text for t in targets):
+                links_found.append((text, urljoin(url, href)))
+        
+        # Remove duplicates and print
+        seen = set()
+        for text, link in links_found:
+            if link not in seen:
+                print(f"[{text}] -> {link}")
+                seen.add(link)
+                
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+========================================================================
+
+===== FILE: final_diagnostic.py =====
+
+import requests
+
+tests = [
+    "https://www.cagdaskocaeli.com.tr/gundem/",
+    "https://www.ozgurkocaeli.com.tr/gundem/",
+    "https://www.seskocaeli.com/guncel/",
+    "https://www.yenikocaeli.com/gundem/",
+    "https://www.bizimyaka.com/gundem/"
+]
+
+headers = {"User-Agent": "Mozilla/5.0"}
+
+print("Final Diagnostic: Simple requests on category pages...")
+
+for url in tests:
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        print(f"URL: {url} -> Status: {r.status_code}, Length: {len(r.text)}")
+    except Exception as e:
+        print(f"URL: {url} -> Error: {e}")
+
+
+========================================================================
+
+===== FILE: find_sections.py =====
+
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse
+
+urls = [
+    "https://www.yenikocaeli.com",
+    "https://www.bizimyaka.com"
+]
+
+headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+
+for url in urls:
+    print(f"--- {url} ---")
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        soup = BeautifulSoup(resp.content, "lxml")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            text = a.get_text(strip=True)
+            if any(t in text.lower() for t in ["gündem", "gundem", "asayiş", "asayis", "arayis", "yerel", "yaşam", "yasam", "son dakika"]):
+                print(f"Text: {text} | Link: {urljoin(url, href)}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+========================================================================
+
+===== FILE: read_pdf.py =====
+
+import pypdf
+import sys
+
+def extract_text(pdf_path):
+    try:
+        reader = pypdf.PdfReader(pdf_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        return f"Error: {e}"
+
+if __name__ == "__main__":
+    pdf_path = r"c:\Users\PISHTAAZ SOFTWARE\Desktop\Project\Yazlab 2- Proje 1.pdf"
+    content = extract_text(pdf_path)
+    with open("pdf_content.txt", "w", encoding="utf-8") as f:
+        f.write(content)
+    print("Content written to pdf_content.txt")
+
+
+========================================================================
+
+===== FILE: temp_verify.py =====
+
+import sys
+import os
+import io
+
+# Set UTF-8 encoding for stdout
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+# Add project root to sys.path
+sys.path.append(r"C:\Users\PISHTAAZ SOFTWARE\Desktop\Project")
+
+from backend.services.nlp import classify_news
+
+test_cases = [
+    ("Atığını sokağa atan sürücüye fotokapan takibi", "Diğer"),
+    ("Yangında evleri küle dönmüştü: Aktekin çiftinin sıcak yuvası yeniden kuruldu.", "Diğer"),
+    ("Dilovası’nda hayvan ağılında yangın!", "Yangın")
+]
+
+print("--- RESULTS ---")
+for text, expected in test_cases:
+    result = classify_news(text, title="")
+    print(f"CASE: '{text}'")
+    print(f"EXPECTED: {expected} | GOT: {result}")
+    print("MATCH: " + ("PASS" if result == expected else "FAIL"))
+    print("-" * 20)
+
+
+========================================================================
+
+===== FILE: test_article_requests.py =====
+
+import requests
+from bs4 import BeautifulSoup
+import re
+
+SITES = [
+    {"name": "Çağdaş", "url": "https://www.cagdaskocaeli.com.tr/gundem/"},
+    {"name": "Özgür", "url": "https://www.ozgurkocaeli.com.tr/gundem/"},
+    {"name": "Ses", "url": "https://www.seskocaeli.com/guncel/"},
+    {"name": "Yeni", "url": "https://www.yenikocaeli.com/gundem/"},
+    {"name": "Bizim", "url": "https://www.bizimyaka.com/gundem/"}
+]
+
+headers = {"User-Agent": "Mozilla/5.0"}
+
+print("Testing Article Content Fetch with simple requests...")
+
+for site in SITES:
+    try:
+        # Step 1: Get listing page
+        r = requests.get(site["url"], headers=headers, timeout=10)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "lxml")
+            # Find first link that looks like an article
+            links = []
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                # Rough check for article link
+                if re.search(r"/\d{4,}/|/haber/|/gundem/", href):
+                    if href.startswith("/"):
+                         href = site["url"].split(".tr/")[0] + ".tr" + href if ".tr" in site["url"] else site["url"].split(".com/")[0] + ".com" + href
+                    links.append(href)
+            
+            if links:
+                test_url = links[0]
+                print(f"{site['name']} -> Listing OK. Testing article: {test_url}")
+                art_r = requests.get(test_url, headers=headers, timeout=10)
+                print(f"   Article Status: {art_r.status_code}, Length: {len(art_r.text)}")
+            else:
+                 print(f"{site['name']} -> Listing OK, but no article links found.")
+        else:
+             print(f"{site['name']} -> Listing FAILED: {r.status_code}")
+    except Exception as e:
+        print(f"{site['name']} -> Error {e}")
+
+
+========================================================================
+
+===== FILE: test_feeds.py =====
+
+import requests
+
+h = {"User-Agent": "Mozilla/5.0 (compatible; RSS reader)", "Accept": "application/rss+xml, application/xml, text/xml"}
+tests = [
+    ("Ses /feed", "https://www.seskocaeli.com/feed"),
+    ("Ses /feed/", "https://www.seskocaeli.com/feed/"),
+    ("Cagdas /feed", "https://www.cagdaskocaeli.com.tr/feed"),
+    ("Cagdas /feed/", "https://www.cagdaskocaeli.com.tr/feed/"),
+    ("Ozgur /feed", "https://www.ozgurkocaeli.com.tr/feed"),
+    ("Ozgur /feed/", "https://www.ozgurkocaeli.com.tr/feed/"),
+    ("Yeni /feed", "https://www.yenikocaeli.com/feed"),
+    ("Bizim /feed", "https://www.bizimyaka.com/feed"),
+    ("Ses /rss", "https://www.seskocaeli.com/rss"),
+    ("Cagdas /rss", "https://www.cagdaskocaeli.com.tr/rss"),
+    ("Ozgur /rss", "https://www.ozgurkocaeli.com.tr/rss"),
+]
+for name, url in tests:
+    try:
+        r = requests.get(url, headers=h, timeout=10)
+        print(f"{name}: STATUS={r.status_code} | CT={r.headers.get('Content-Type','')[:50]}")
+    except Exception as e:
+        print(f"{name}: ERROR - {e}")
+
+
+========================================================================
+
+===== FILE: test_friend_logic.py =====
+
+import requests
+
+SITES = [
+    {"name": "Çağdaş", "url": "https://www.cagdaskocaeli.com.tr/arsiv/"},
+    {"name": "Özgür", "url": "https://www.ozgurkocaeli.com.tr/arsiv/"},
+    {"name": "Ses", "url": "https://www.seskocaeli.com/arsiv/"},
+    {"name": "Yeni", "url": "https://www.yenikocaeli.com/arsiv/"},
+    {"name": "Bizim", "url": "https://www.bizimyaka.com/arsiv/"}
+]
+
+# Friend's suggested header
+headers = {"User-Agent": "Mozilla/5.0"}
+
+print("Testing 'arsiv' URLs with simple requests...")
+
+for site in SITES:
+    try:
+        # try simple request
+        resp = requests.get(site["url"], headers=headers, timeout=10)
+        print(f"{site['name']}: {site['url']} -> Status {resp.status_code}")
+        if resp.status_code == 200:
+             print(f"   Success! Length: {len(resp.text)}")
+    except Exception as e:
+        print(f"{site['name']}: {site['url']} -> Error {e}")
+
+# Also try category URLs
+print("\nTesting 'gundem' categories...")
+CATS = [
+    {"name": "Çağdaş", "url": "https://www.cagdaskocaeli.com.tr/gundem/"},
+    {"name": "Özgür", "url": "https://www.ozgurkocaeli.com.tr/gundem/"},
+    {"name": "Ses", "url": "https://www.seskocaeli.com/guncel/"},
+    {"name": "Yeni", "url": "https://www.yenikocaeli.com/gundem/"},
+    {"name": "Bizim", "url": "https://www.bizimyaka.com/gundem/"}
+]
+
+for cat in CATS:
+    try:
+        resp = requests.get(cat["url"], headers=headers, timeout=10)
+        print(f"{cat['name']}: {cat['url']} -> Status {resp.status_code}")
+    except Exception as e:
+        print(f"{cat['name']}: {cat['url']} -> Error {e}")
+
+
+========================================================================
+
+===== FILE: test_friend_logic_detailed.py =====
+
+import requests
+
+sites_to_test = [
+    # Cagdas
+    "https://www.cagdaskocaeli.com.tr/gundem/",
+    "https://www.cagdaskocaeli.com.tr/arsiv/",
+    # Ozgur
+    "https://www.ozgurkocaeli.com.tr/gundem/",
+    "https://www.ozgurkocaeli.com.tr/arsiv/",
+    # Ses
+    "https://www.seskocaeli.com/guncel/",
+    "https://www.seskocaeli.com/arsiv/",
+    # Yeni
+    "https://www.yenikocaeli.com/gundem/",
+    "https://www.yenikocaeli.com/arsiv/",
+    # Bizim Yaka
+    "https://www.bizimyaka.com/gundem/",
+    "https://www.bizimyaka.com/arsiv/"
+]
+
+headers = {"User-Agent": "Mozilla/5.0"}
+
+print("Starting Simple Request Test (Friend's logic)...")
+
+for url in sites_to_test:
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        print(f"URL: {url} -> Status: {r.status_code}")
+        if r.status_code == 200:
+            print(f"   [SUCCESS] Length: {len(r.text)}")
+    except Exception as e:
+        print(f"URL: {url} -> Error: {e}")
+
+
+========================================================================
+
+===== FILE: test_geocoding_districts.py =====
+
+import googlemaps
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+API_KEY = os.getenv("GOOGLE_MAPS_API_KEY")
+gmaps = googlemaps.Client(key=API_KEY)
+
+districts = [
+    "İzmit", "Gebze", "Gölcük", "Derince", "Darıca", 
+    "Körfez", "Kartepe", "Başiskele", "Karamürsel", 
+    "Kandıra", "Dilovası", "Çayırova"
+]
+
+print(f"Testing Google Geocoding for Kocaeli Districts (Key: {API_KEY[:5]}...{API_KEY[-5:]})")
+
+for d in districts:
+    query = f"{d}, Kocaeli, Turkey"
+    res = gmaps.geocode(query)
+    if res:
+        loc = res[0]['geometry']['location']
+        addr = res[0]['formatted_address']
+        print(f"[{d}] -> {addr} | Coords: {loc['lat']}, {loc['lng']}")
+    else:
+        print(f"[{d}] -> FAILED")
+
+
+========================================================================
+
+===== FILE: test_google_rss.py =====
+
+"""
+Test Google News RSS as bypass for blocked sites.
+Google News caches articles and serves them from news.google.com — never blocked.
+"""
+import requests
+import feedparser
+from urllib.parse import quote
+
+queries = [
+    "Kocaeli kaza",
+    "Kocaeli yangın",
+    "Kocaeli hırsızlık",
+    "Kocaeli elektrik kesintisi",
+    "Kocaeli festival etkinlik",
+    "seskocaeli.com",
+    "cagdaskocaeli.com.tr",
+    "ozgurkocaeli.com.tr site:seskocaeli.com OR site:cagdaskocaeli.com.tr OR site:ozgurkocaeli.com.tr",
+]
+
+h = {"User-Agent": "Mozilla/5.0 (compatible; RSS reader)"}
+
+for q in queries:
+    encoded = quote(q)
+    url = f"https://news.google.com/rss/search?q={encoded}&hl=tr&gl=TR&ceid=TR:tr"
+    try:
+        r = requests.get(url, headers=h, timeout=10)
+        feed = feedparser.parse(r.content)
+        print(f"\nQuery: {q}")
+        print(f"  Status: {r.status_code}, Entries: {len(feed.entries)}")
+        for e in feed.entries[:3]:
+            print(f"  - {e.title[:70]} | {e.get('published','')[:20]}")
+    except Exception as ex:
+        print(f"  ERROR: {ex}")
+
+
+========================================================================
+
+===== FILE: test_loc.py =====
+
+from backend.services.geocoding import extract_location_info
+
+title = "İzmit’te feci kaza: 2 yaralı"
+text = "Kocaeli'nin İzmit ilçesinde meydana gelen trafik kazasında 2 kişi yaralandı. Olay yerine itfaiye ve sağlık ekipleri sevk edildi."
+
+info = extract_location_info(title, text)
+print(f"Info: {info}")
+
+
+========================================================================
+
+===== FILE: test_nlp_fixes.py =====
+
+import sys
+import os
+
+# Add backend to path
+sys.path.append(os.path.join(os.getcwd(), 'backend'))
+
+from services.nlp import classify_news
+
+def test_nlp():
+    test_cases = [
+        {
+            "title": "Büyükşehir den Dilovası na modern hizmet binası",
+            "content": "Kocaeli Büyükşehir Belediyesi Dilovası ilçesine modern bir hizmet binası kazandırıyor.",
+            "expected": "Diğer"
+        },
+        {
+            "title": "Dilovası davasında sanığın Şov yapmayın sözleri tansiyonu yükseltti",
+            "content": "Kocaeli Dilovası'ndaki bir davanın duruşmasında sanığın hakime yönelik sözleri ortalığı karıştırdı.",
+            "expected": "Diğer"
+        },
+        {
+            "title": "Körfez'de trafik kazası: 2 yaralı",
+            "content": "Kocaeli'nin Körfez ilçesinde iki otomobilin çarpışması sonucu meydana gelen trafik kazasında 2 kişi yaralandı.",
+            "expected": "Trafik Kazası"
+        }
+    ]
+
+    print("--- NLP Fix Verification ---")
+    for tc in test_cases:
+        result = classify_news(tc["content"], tc["title"])
+        status = "✅ PASS" if result == tc["expected"] else f"❌ FAIL (Got: {result})"
+        print(f"Title: {tc['title'][:50]}...")
+        print(f"Result: {result} | Expected: {tc['expected']} | {status}")
+        print("-" * 30)
+
+if __name__ == "__main__":
+    test_nlp()
+
+
+========================================================================
+
+===== FILE: test_one_article.py =====
+
+import requests
+from bs4 import BeautifulSoup
+import re
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+}
+
+def test_article(url):
+    print(f"Testing URL: {url}")
+    r = requests.get(url, headers=HEADERS, timeout=10)
+    print(f"Status: {r.status_code}")
+    if r.status_code != 200: return
+    
+    s = BeautifulSoup(r.text, "lxml")
+    
+    # Title
+    og = s.find("meta", property="og:title")
+    title = og["content"] if og and og.get("content") else (s.find("h1").get_text(strip=True) if s.find("h1") else "???")
+    print(f"Title: {title}")
+    
+    # Content
+    c_div = s.select_one(".news-content, .article-content, .entry-content, article, .haber-metni, .habericerik")
+    if c_div:
+        paras = [p.get_text(strip=True) for p in c_div.find_all("p") if len(p.get_text(strip=True)) > 20]
+        content = " ".join(paras)
+    else:
+        content = "(Selector failed)"
+    
+    print(f"Content Length: {len(content)}")
+    print(f"Content Snippet: {content[:300]}")
+
+test_article("https://www.cagdaskocaeli.com.tr/haber/27706619/kocaelide-engelsiz-sanat")
+
+
+========================================================================
+
+===== FILE: test_simple_requests_again.py =====
+
+import requests
+
+SITES = [
+    "https://www.cagdaskocaeli.com.tr/",
+    "https://www.ozgurkocaeli.com.tr/",
+    "https://www.seskocaeli.com/",
+    "https://www.yenikocaeli.com/",
+    "https://www.bizimyaka.com/"
+]
+
+headers = {"User-Agent": "Mozilla/5.0"}
+
+for site in SITES:
+    try:
+        response = requests.get(site, headers=headers, timeout=10)
+        print(f"{site}: Status {response.status_code}, Length {len(response.text)}")
+    except Exception as e:
+        print(f"{site}: Error {e}")
+
+
+========================================================================
+
+===== FILE: tmp_check_db.py =====
+
+from motor.motor_asyncio import AsyncIOMotorClient
+import asyncio
+
+async def check_db():
+    client = AsyncIOMotorClient("mongodb://localhost:27017")
+    db = client.kocaeli_news
+    count = await db.news.count_documents({})
+    print(f"Total News in DB: {count}")
+    
+    with_coords = await db.news.count_documents({"latitude": {"$ne": None}})
+    print(f"News with valid coordinates: {with_coords}")
+    
+    no_coords = await db.news.count_documents({"latitude": None})
+    print(f"News with NULL coordinates: {no_coords}")
+    
+    sample = await db.news.find().limit(10).to_list(10)
+    print("\nSample Data:")
+    for s in sample:
+        print(f"- {s['title']} | Location: {s.get('location_text')} | Coords: {s.get('latitude')}, {s.get('longitude')}")
+
+if __name__ == "__main__":
+    asyncio.run(check_db())
+
+
+========================================================================
+
+===== FILE: tmp_clean_db.py =====
+
+import asyncio
+from motor.motor_asyncio import AsyncIOMotorClient
+from backend.services.nlp import classify_news
+
+MONGO_URL = "mongodb://localhost:27017"
+client = AsyncIOMotorClient(MONGO_URL)
+db = client.kocaeli_news
+news_collection = db.news
+
+async def main():
+    cursor = news_collection.find({})
+    to_delete = []
+    
+    async for news in cursor:
+        category = classify_news(news.get("content", ""), title=news.get("title", ""))
+        if category == "Diğer":
+            to_delete.append(news["_id"])
+            
+    if to_delete:
+        await news_collection.delete_many({"_id": {"$in": to_delete}})
+        print(f"Deleted {len(to_delete)} false-positive news from the database.")
+    else:
+        print("No false-positive news found.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+========================================================================
+
+===== FILE: tmp_test_feeds.py =====
+
+import feedparser
+import requests
+
+RSS_FEEDS = {
+    "Çağdaş Kocaeli": "https://www.cagdaskocaeli.com.tr/rss",
+    "Özgür Kocaeli": "https://www.ozgurkocaeli.com.tr/rss",
+    "Ses Kocaeli": "https://www.seskocaeli.com/rss",
+    "Yeni Kocaeli": "https://www.yenikocaeli.com/rss",
+    "Bizim Yaka": "https://www.bizimyaka.com/rss"
+}
+
+print("Starting quick feed diagnosis...")
+
+for name, url in RSS_FEEDS.items():
+    print(f"--- Testing: {name} ({url}) ---")
+    try:
+        resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}, timeout=10)
+        if resp.status_code == 200:
+            feed = feedparser.parse(resp.content)
+            print(f"  -> [OK] Reached site. Found {len(feed.entries)} news entries in the RSS.")
+            if len(feed.entries) > 0:
+                print(f"  -> [INFO] Sample Title: {getattr(feed.entries[0], 'title', 'No Title')}")
+        else:
+            print(f"  -> [FAIL] HTTP Error: {resp.status_code}")
+            
+    except requests.exceptions.Timeout:
+        print("  -> [FAIL] Connection timed out (Site is extremely slow or down).")
+    except Exception as e:
+        print(f"  -> [FAIL] Error: {e}")
+    print()
+
+
+========================================================================
+
+===== FILE: verify_multi_source.py =====
+
+from pymongo import MongoClient
+
+def verify():
+    client = MongoClient('mongodb://localhost:27017')
+    db = client.kocaeli_news
+    news_list = list(db.news.find({}))
+    
+    multi_source = [n for n in news_list if len(n.get('sources', [])) > 1]
+    
+    print(f"Total News in DB: {len(news_list)}")
+    print(f"Items with more than 1 source: {len(multi_source)}")
+    
+    for n in multi_source:
+        print(f"\n[MUTLI-SOURCE] {n['title']}")
+        for s in n['sources']:
+            print(f"  - {s['name']}: {s['url']}")
+
+if __name__ == "__main__":
+    verify()
+
+
+========================================================================
+
+===== FILE: verify_reliability.py =====
+
+from motor.motor_asyncio import AsyncIOMotorClient
+import asyncio
+import re
+
+async def check_raw_coverage():
+    client = AsyncIOMotorClient("mongodb://localhost:27017")
+    db = client.kocaeli_news
+    
+    news_list = await db.news.find({}).to_list(length=100)
+    
+    print(f"Total News in DB: {len(news_list)}")
+    print("-" * 50)
+    
+    # Critical keywords to look for manually
+    test_keywords = {
+        "Kaza": ["kaza", "çarpışt", "devrild"],
+        "Yangın": ["yangın", "alev", "itfaiy"],
+        "Hırsızlık": ["hırsız", "çalınd", "soygun"],
+        "Kesinti": ["kesinti", "sedaş", "elektrik"]
+    }
+    
+    matches_found = 0
+    for n in news_list:
+        title = n['title']
+        content = n['content']
+        text = (title + " " + content).lower()
+        
+        found_types = []
+        for cat, kws in test_keywords.items():
+            if any(kw in text for kw in kws):
+                found_types.append(cat)
+        
+        if found_types:
+            print(f"[!] POTENTIAL MATCH | {title[:50]}... | Found: {found_types} | Current Cat: {n['category']}")
+            matches_found += 1
+            
+    if matches_found == 0:
+        print("✅ Audited all news: No mentions of Accidents, Fire, or Theft found in raw content.")
+    else:
+        print(f"\nFound {matches_found} potential items that might need stricter or looser classification.")
+
+if __name__ == "__main__":
+    asyncio.run(check_raw_coverage())
+
+
+========================================================================
+
+===== FILE: verify_upgrades.py =====
+
+import sys
+import os
+
+# Add the project root to sys.path
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Handle Turkish characters on Windows
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+
+from backend.services.nlp import classify_news
+from backend.services.geocoding import extract_location_info
+
+def test_semantic_classification():
+    print("--- Testing Semantic Classification ---")
+    test_cases = [
+        ("mahalle günlerdir ışıksız kaldı", "Elektrik Kesintisi"),
+        ("D-100 karayolunda iki araç kafa kafaya vuruştu", "Trafik Kazası"),
+        ("Binadaki alevler gökyüzünü sardı", "Yangın"),
+        ("Evdeki mücevherleri çalıp kayıplara karıştılar", "Hırsızlık"),
+        ("Kocaeli'de Şehir Tiyatroları muhteşem bir prömiyer yaptı", "Kültürel Etkinlikler"),
+        ("Belediye başkanı park açılışına katıldı", "Diğer"),
+        ("Atığını sokağa atan sürücüye fotokapan takibi", "Diğer"), # Should NOT be Trafik Kazası
+        ("Yangında evleri küle dönmüştü: Aktekin çiftinin sıcak yuvası yeniden kuruldu.", "Diğer"), # Retrospective
+        ("Dilovası’nda hayvan ağılında yangın!", "Yangın")
+    ]
+    
+    for text, expected in test_cases:
+        result = classify_news(text, title="")
+        status = "✅" if result == expected else f"❌ (Got: {result})"
+        print(f"Text: '{text}' -> Result: {result} {status}")
+
+def test_ner_location_extraction():
+    print("\n--- Testing NER Location Extraction ---")
+    test_cases = [
+        ("Gebze mahallesinde yangın çıktı.", "Gebze"),
+        ("İzmit Yürüyüş Yolu üzerinde etkinlik düzenlendi.", "İzmit"),
+        ("Körfez Tütünçiftlik mevkiinde kaza.", "Körfez"),
+        ("Kartepe'de kar yağışı durdu.", "Kartepe")
+    ]
+    
+    for text, expected in test_cases:
+        # We pass empty title or same text for simplicity in test
+        result = extract_location_info("", text)
+        if result:
+            best = result.get("best_location_text", "None")
+            district = result.get("district", "None")
+            print(f"Text: '{text}' -> Best Location: {best}, District: {district}")
+        else:
+            print(f"Text: '{text}' -> No location found ❌")
+
+if __name__ == "__main__":
+    test_semantic_classification()
+    test_ner_location_extraction()
+
+
+========================================================================
+
+===== FILE: verify_urls.py =====
+
+import requests
+
+sites = [
+    "https://www.yenikocaeli.com/kategori/gundem/",
+    "https://www.yenikocaeli.com/kategori/son-dakika/",
+    "https://www.bizimyaka.com/kategori/gundem/",
+    "https://www.bizimyaka.com/haberler/"
+]
+
+headers = {"User-Agent": "Mozilla/5.0"}
+
+for url in sites:
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        print(f"URL: {url} -> Status: {r.status_code}")
+    except Exception as e:
+        print(f"URL: {url} -> Error: {e}")

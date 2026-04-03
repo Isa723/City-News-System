@@ -127,7 +127,6 @@ SITE_CONFIGS = [
         "listing_urls": [
             "https://www.ozgurkocaeli.com.tr/arsiv/kocaeli-haberleri",
             "https://www.ozgurkocaeli.com.tr/arsiv/kocaeli-asayis-haberleri",
-            "https://www.ozgurkocaeli.com.tr/arsiv/perde-arkasi",
             "https://www.ozgurkocaeli.com.tr/arsiv/guncel",
             "https://www.ozgurkocaeli.com.tr/arsiv/son-dakika",
             "https://www.ozgurkocaeli.com.tr/arsiv/kocaeli-yasam-haberleri",
@@ -140,7 +139,6 @@ SITE_CONFIGS = [
         "archive_pagination": True,
         "listing_urls": [
             "https://www.seskocaeli.com/arsiv/kocaeli-son-dakika-haberler",
-            "https://www.seskocaeli.com/arsiv/kocaeli-perde-arkasi-haberler",
             "https://www.seskocaeli.com/arsiv/kocaeli-asayis-haberleri",
             "https://www.seskocaeli.com/arsiv/kocaeli-yasam-haberleri",
         ],
@@ -336,6 +334,36 @@ def _extract_publish_datetime(soup: BeautifulSoup, html: str) -> datetime | None
     return None
 
 
+def _normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    t = text.replace("\xa0", " ")
+    t = re.sub(r"[\r\n\t]+", " ", t)
+    t = re.sub(r"[ ]{2,}", " ", t).strip()
+    return t
+
+
+def _is_noise_paragraph(p: str) -> bool:
+    pl = (p or "").lower()
+    if len(pl) < 30:
+        return True
+    ad_markers = (
+        "reklam",
+        "sponsor",
+        "sponsored",
+        "google news",
+        "bizi takip edin",
+        "abone ol",
+        "bildirimleri aç",
+        "yorum yap",
+        "etiketler:",
+        "ilgili haber",
+        "tüm hakları saklıdır",
+        "kaynak:",
+    )
+    return any(m in pl for m in ad_markers)
+
+
 def _fetch_article(url: str, source: str) -> dict | None:
     try:
         r = _http_get(url)
@@ -349,16 +377,31 @@ def _fetch_article(url: str, source: str) -> dict | None:
             if og and og.get("content")
             else (s.find("h1").get_text(strip=True) if s.find("h1") else s.title.get_text(strip=True))
         )
-        title = re.sub(r"\s+", " ", title).strip()
+        title = _normalize_text(title)
 
         c_div = s.select_one(
             ".news-content, .article-content, .entry-content, article, .haber-metni, .habericerik"
         )
         if c_div:
-            paras = [p.get_text(strip=True) for p in c_div.find_all("p") if len(p.get_text(strip=True)) > 30]
-            content = " ".join(paras) if paras else c_div.get_text(separator=" ", strip=True)
+            paras_raw = [p.get_text(" ", strip=True) for p in c_div.find_all("p")]
+            paras = []
+            for pr in paras_raw:
+                ptxt = _normalize_text(pr)
+                if _is_noise_paragraph(ptxt):
+                    continue
+                paras.append(ptxt)
+            content = " ".join(paras) if paras else _normalize_text(c_div.get_text(separator=" ", strip=True))
         else:
-            content = " ".join([p.get_text(strip=True) for p in s.find_all("p") if len(p.get_text(strip=True)) > 40][:10])
+            fallback = []
+            for p in s.find_all("p"):
+                ptxt = _normalize_text(p.get_text(" ", strip=True))
+                if _is_noise_paragraph(ptxt):
+                    continue
+                fallback.append(ptxt)
+                if len(fallback) >= 10:
+                    break
+            content = " ".join(fallback)
+        content = _normalize_text(content)
 
         if not title:
             return None

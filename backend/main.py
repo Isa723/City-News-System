@@ -6,6 +6,7 @@ from typing import List, Optional
 import uvicorn
 import os
 import subprocess
+import sys
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -134,19 +135,16 @@ async def trigger_scraper(date_from: Optional[str] = None, date_to: Optional[str
         if scraper_process and scraper_process.poll() is None:
             return {"status": "already_running", "message": "Scraping is already in progress."}
 
-        # Get the path to the current virtual environment's python
-        venv_python = os.path.join(os.getcwd(), ".venv", "Scripts", "python.exe")
-        if not os.path.exists(venv_python):
-            venv_python = "python" # Fallback
-            
-        args = [venv_python, "backend/scraper_runner.py"]
+        # Same interpreter as this API process (works with .venv, external venv, or global).
+        # Avoid hard-coding .venv: if it was removed, "python" fallback often lacks deps.
+        scraper_script = os.path.join(project_root, "backend", "scraper_runner.py")
+        args = [sys.executable, scraper_script]
         if date_from:
             args += ["--date-from", date_from]
         if date_to:
             args += ["--date-to", date_to]
 
-        # Run the standalone scraper script async
-        scraper_process = subprocess.Popen(args)
+        scraper_process = subprocess.Popen(args, cwd=project_root)
         return {"status": "success", "message": "Scraping started in the background..."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

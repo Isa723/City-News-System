@@ -23,6 +23,29 @@ def get_model():
 # --- mDeBERTa zero-shot: categorization only (lazy load) ---
 _classifier = None
 _classifier_failed = False
+TARGET_LABELS = [
+    "Trafik Kazası",
+    "Yangın",
+    "Hırsızlık",
+    "Elektrik Kesintisi",
+    "Kültürel Etkinlik",
+]
+TRAP_LABELS = [
+    "Cinayet ve Şiddet",
+    "Asayiş ve Polis Operasyonu",
+    "Mahkeme ve Adliye",
+    "Siyaset ve Belediye",
+    "Spor",
+    "Ekonomi ve İş",
+    "Eğitim",
+    "Sağlık",
+    "Magazin",
+]
+RELEVANCE_LABELS = [
+    "Kocaeli yerel olay haberi",
+    "Kocaeli dışı haber",
+    "Olay içermeyen duyuru veya genel haber",
+]
 
 
 def _contains_any(text: str, keywords: list[str]) -> bool:
@@ -30,26 +53,145 @@ def _contains_any(text: str, keywords: list[str]) -> bool:
     return any(k in t for k in keywords)
 
 
-def _has_category_evidence(label: str, text: str) -> bool:
+def _category_score(label: str, text: str) -> float:
     t = (text or "").lower()
-    evidence = {
+    evidence_weights = {
         "Trafik Kazası": [
-            "kaza", "trafik", "çarp", "çarpış", "zincirleme", "devril", "takla", "sürücü", "araç",
+            ("trafik kazası", 3.0),
+            ("zincirleme", 2.5),
+            ("çarpış", 2.0),
+            ("çarp", 1.5),
+            ("kaza", 2.8),
+            ("devril", 2.0),
+            ("takla", 2.0),
+            ("yaralı", 1.3),
+            ("sürücü", 1.0),
+            ("araç", 0.8),
+            ("trafik", 0.5),
         ],
         "Yangın": [
-            "yangın", "alev", "duman", "itfaiye", "yandı", "yanan", "yanarak", "küller", "kule döndü",
+            ("yangın", 3.0),
+            ("alev", 2.0),
+            ("itfaiye", 2.0),
+            ("küle döndü", 3.0),
+            ("duman", 1.5),
+            ("yandı", 2.2),
+            ("yanan", 1.8),
+            ("yanarak", 1.8),
+            ("alev aldı", 2.5),
+            ("yangın çıktı", 2.5),
         ],
         "Hırsızlık": [
-            "hırsız", "hırsızlık", "soygun", "gasp", "çal", "yağma", "kasadan", "çalındı",
+            ("hırsızlık", 3.0),
+            ("hırsız", 2.8),
+            ("soygun", 2.6),
+            ("gasp", 2.6),
+            ("yağma", 2.8),
+            ("çalındı", 2.5),
+            ("çal", 1.2),
+            ("kasadan", 1.8),
         ],
         "Elektrik Kesintisi": [
-            "elektrik kesint", "elektrikler kesildi", "enerji kesint", "sedaş", "sedaş", "trafo", "arıza",
+            ("elektrik kesint", 3.0),
+            ("elektrikler kesildi", 3.0),
+            ("enerji kesint", 2.8),
+            ("sedaş", 2.4),
+            ("trafo", 1.6),
+            ("elektrik arıza", 2.0),
+            ("enerji verilemedi", 2.2),
+            ("elektriksiz", 3.0),
         ],
         "Kültürel Etkinlikler": [
-            "festival", "konser", "tiyatro", "etkinlik", "sergi", "şenlik", "gösteri", "sahne",
+            ("festival", 2.8),
+            ("konser", 2.8),
+            ("tiyatro", 2.8),
+            ("sergi", 2.4),
+            ("şenlik", 2.2),
+            ("gösteri", 2.0),
+            ("sahne", 1.4),
+            ("etkinlik", 1.0),
+            ("kültür", 1.0),
         ],
     }
-    return _contains_any(t, evidence.get(label, []))
+    score = 0.0
+    for term, weight in evidence_weights.get(label, []):
+        if term in t:
+            score += weight
+
+    # Strong blockers as penalty
+    if _has_category_blocker(label, t):
+        score -= 2.5
+
+    # Event trigger requirement for critical categories
+    triggers = {
+        "Trafik Kazası": ["çarp", "çarpış", "devril", "takla", "kaza yaptı", "kaza"],
+        "Yangın": ["yandı", "alev aldı", "yangın çıktı", "itfaiye müdahale", "alev"],
+        "Hırsızlık": ["çalındı", "soygun", "gasp", "hırsızlık", "yağma"],
+    }
+    if label in triggers and not _contains_any(t, triggers[label]):
+        score *= 0.5
+
+    return score
+
+
+def _has_category_blocker(label: str, text: str) -> bool:
+    t = (text or "").lower()
+    blockers = {
+        "Yangın": [
+            "ruhsat denetim", "bahar temizliği", "yabani ot",
+            "ot biç", "ilaçlama", "denetimleri sürüyor",
+            "yangın tatbikatı", "yangın eğitimi", "önlem",
+            "yangın riski", "yangın uyarısı", "yangın önleme",
+        ],
+
+        "Elektrik Kesintisi": [
+            "su kesintisi", "sular ne zaman", "isu'dan", "isu ",
+            "su arızası", "su arizasi", "içme suyu", "kanalizasyon",
+            "altyapı çalışması", "boru patladı", "su hattı",
+        ],
+
+        "Trafik Kazası": [
+            "trafik denetimi", "trafik cezası", "ehliyet",
+            "radar uygulaması", "kontrol noktası", "trafik eğitimi", 
+            "trafik haftası", "ulaşım planı", "altyapı çalışması",
+        ],
+
+        "Hırsızlık": [
+            "tatbikat", "film", "dizi", "senaryo",
+        ],
+
+        "Kültürel Etkinlikler": [
+            "siyasi toplantı", "basın açıklaması",
+            "protesto", "miting",
+        ],
+    }
+    return _contains_any(t, blockers.get(label, []))
+
+
+def _normalize_target_label(label: str) -> str:
+    if label == "Kültürel Etkinlik":
+        return "Kültürel Etkinlikler"
+    return label
+
+
+def _passes_relevance_gate(classifier, text_to_check: str) -> bool:
+    try:
+        result = classifier(
+            text_to_check,
+            RELEVANCE_LABELS,
+            hypothesis_template="Bu metin {}.",
+            multi_label=False,
+        )
+        top = result["labels"][0]
+        score = float(result["scores"][0])
+        # Be less aggressive: we only want to drop clearly non-local items.
+        # Loosening prevents "important-but-unfamiliar" wording from being abstained too often.
+        if top != "Kocaeli yerel olay haberi" and score >= 0.65:
+            return False
+        return True
+    except Exception:
+        # Technical error on gate should not hard-drop all news.
+        return True
 
 
 def get_classifier():
@@ -63,13 +205,21 @@ def get_classifier():
         print("Loading mDeBERTa zero-shot classifier (MoritzLaurer/mDeBERTa-v3-base-mnli-xnli)...")
         use_cuda = torch.cuda.is_available()
         if use_cuda:
+            # HF model card: mDeBERTa has known FP16 issues; use default float32 on GPU.
+            name = torch.cuda.get_device_name(0)
+            print(f"Zero-shot classifier device: CUDA (GPU 0: {name})")
             _classifier = pipeline(
                 "zero-shot-classification",
                 model="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
                 device=0,
-                torch_dtype=torch.float16,
             )
         else:
+            print(
+                "Zero-shot classifier device: CPU. "
+                "torch.cuda.is_available() is False — usually CPU-only PyTorch, "
+                "missing NVIDIA driver, or no CUDA-capable GPU. "
+                "Install CUDA-enabled torch from https://pytorch.org/get-started/locally/ if you have an NVIDIA GPU."
+            )
             _classifier = pipeline(
                 "zero-shot-classification",
                 model="MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
@@ -93,21 +243,7 @@ def classify_news(content, title=""):
         return "Diğer"
 
     text_to_check = f"{title}. {(content or '')[:600]}"
-
-    candidate_labels = [
-        "Trafik Kazası",
-        "Yangın",
-        "Hırsızlık",
-        "Elektrik Kesintisi",
-        "Kültürel Etkinlik",
-        "Cinayet ve Şiddet",
-        "Asayiş ve Polis Operasyonu",
-        "Mahkeme ve Adliye",
-        "Siyaset ve Belediye",
-        "Spor",
-        "Ekonomi ve İş",
-        "Eğitim",
-    ]
+    candidate_labels = TARGET_LABELS + TRAP_LABELS
 
     hypothesis_template = "Bu haber {} hakkındadır."
 
@@ -116,36 +252,57 @@ def classify_news(content, title=""):
         return "Diğer"
 
     try:
+        if not _passes_relevance_gate(classifier, text_to_check):
+            return "Diğer"
+
         result = classifier(
             text_to_check,
             candidate_labels,
             hypothesis_template=hypothesis_template,
             multi_label=False,
         )
+        score_map = {lab: float(sc) for lab, sc in zip(result["labels"], result["scores"])}
+        best_target_raw = max(TARGET_LABELS, key=lambda l: score_map.get(l, 0.0))
+        best_target = _normalize_target_label(best_target_raw)
+        best_target_score = score_map.get(best_target_raw, 0.0)
+        best_trap = max(TRAP_LABELS, key=lambda l: score_map.get(l, 0.0))
+        best_trap_score = score_map.get(best_trap, 0.0)
 
-        best_label = result["labels"][0]
-        best_score = float(result["scores"][0])
+        print(
+            f"   AI target: {best_target} ({best_target_score * 100:.1f}%), "
+            f"trap: {best_trap} ({best_trap_score * 100:.1f}%)"
+        )
 
-        print(f"   AI: {best_label} ({best_score * 100:.1f}%)")
-
-        if best_label == "Kültürel Etkinlik":
-            best_label = "Kültürel Etkinlikler"
-
-        target_categories = [
-            "Trafik Kazası",
-            "Yangın",
-            "Hırsızlık",
-            "Elektrik Kesintisi",
-            "Kültürel Etkinlikler",
-        ]
-
-        # Hard gate: never emit rubric category without lexical evidence.
-        if best_label in target_categories and not _has_category_evidence(best_label, text_to_check):
+        # Trap ratio rule: if trap is too close/high, abstain.
+        # Loosen a bit to prioritize recall over precision (user says missing is worse).
+        if best_trap_score > (best_target_score * 0.90):
             return "Diğer"
 
-        if best_label in target_categories and best_score > 0.35:
-            return best_label
-        return "Diğer"
+        # Fuse AI score + weighted keyword score (title is boosted).
+        fused_scores: dict[str, float] = {}
+        for raw_label in TARGET_LABELS:
+            norm_label = _normalize_target_label(raw_label)
+            ai = score_map.get(raw_label, 0.0)
+            kw_content = _category_score(norm_label, content or "")
+            kw_title = _category_score(norm_label, title or "")
+            kw_total = kw_content + (kw_title * 1.3)
+            # Normalize keyword score to [0, 1] for stable fusion.
+            kw_norm = max(0.0, min(1.0, kw_total / 10.0))
+            fused_scores[norm_label] = (ai * 0.6) + (kw_norm * 0.4)
+
+        best_fused = max(fused_scores, key=fused_scores.get)
+        best_fused_score = fused_scores[best_fused]
+
+        print(f"   FUSED: {best_fused} ({best_fused_score * 100:.1f}%)")
+
+        # Minimum acceptance threshold.
+        # Lowering slightly increases recall without adding more model calls.
+        if best_fused_score < 0.45:
+            return "Diğer"
+        if _has_category_blocker(best_fused, text_to_check):
+            return "Diğer"
+
+        return best_fused
     except Exception as e:
         print(f"Classification failed: {e}")
         return "Diğer"

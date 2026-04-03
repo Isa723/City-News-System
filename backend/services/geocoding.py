@@ -68,7 +68,8 @@ OTHER_TURKEY_PLACES = frozenset(
         "denizli", "afyon", "usak", "kutahya", "bursa", "yalova", "sakarya", "duzce", "bartin",
         "kastamonu", "corum", "yozgat", "nevsehir", "kirsehir", "kirikkale", "ankara", "konya",
         "eskisehir", "kayseri", "nigde", "aksaray", "karaman", "mersin", "adana", "istanbul",
-        "izmir", "bodrum", "fethiye",
+        "izmir", "bodrum", "fethiye","bilecik", "artvin", "bayburt", "cankiri", "erzurum",
+        "gumushane", "karabuk",
     }
 )
 
@@ -261,10 +262,14 @@ def extract_location_info(title: str, text: str) -> Optional[Dict[str, Any]]:
             "candidates": sorted(set(candidates)),
         }
     
-    # District-only: require ilçe in the headline — body-only is too weak (wire copy, wrong pins).
+    # District-only:
+    # - If ilçe is in the headline -> high confidence.
+    # - If ilçe is only in the body, allow it only when it appears early (near the top),
+    #   to avoid false pins from generic / late mentions.
     if district_positions:
         district_positions.sort(key=lambda x: x[0])
-        if not district_in_title:
+        earliest_pos = district_positions[0][0] if district_positions else 999999
+        if not district_in_title and earliest_pos > 220:
             return None
         ordered_districts = [d for pos, d in district_positions]
         if len(ordered_districts) > 1 and ordered_districts[0] == "İzmit":

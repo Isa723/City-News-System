@@ -1,10 +1,12 @@
 @echo off
+cd /d "%~dp0"
+
 echo ==========================================
 echo   Kocaeli News Map - Startup Script
 echo ==========================================
 echo.
 echo [1/2] Activating Virtual Environment...
-call .\.venv\Scripts\activate
+call D:\Installed\venvs\kocaeli-news\Scripts\activate
 
 echo [2/2] Starting Uvicorn Server on http://127.0.0.1:8000/app/
 echo.
